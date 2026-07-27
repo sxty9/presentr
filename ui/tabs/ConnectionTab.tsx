@@ -19,16 +19,15 @@ import {
   cn,
   useT,
   type ServiceContextProps,
-} from '@holisdk/ui';
+} from '@holistic/ui';
 import type {
-  AigenticResult,
   DiagramEdge,
   DiagramGraph,
   DiagramNode,
   DiagramView,
   DocsResponse,
-  PrizmEnvelope,
 } from '../types';
+import { askRoom, roomGrounding } from '../roomAI';
 import {
   EXTRACT_PROMPT,
   NODE_H,
@@ -52,8 +51,6 @@ import {
 // The SDK has no graph/canvas primitive and service UIs may not render raw SVG, so the diagram is
 // drawn purely from SDK primitives: each device is an absolutely-positioned Box, and each connection
 // is a thin Box rotated to point from one port to the other (see diagramLib.lineBox).
-
-const ENGINE = 'choose';
 
 export function ConnectionTab({ api, apiFor, ui }: Pick<ServiceContextProps, 'api' | 'apiFor' | 'ui'>) {
   const t = useT();
@@ -179,14 +176,8 @@ export function ConnectionTab({ api, apiFor, ui }: Pick<ServiceContextProps, 'ap
         ui.toast({ title: t('presentr.diagramNeedDocs'), variant: 'info' });
         return;
       }
-      const inline = docs
-        .filter((d) => d.content && d.content.trim())
-        .map((d) => ({ path: d.title || 'document', content: d.content, mediaType: 'text/markdown' }));
-      const env = await apiFor('aigentic').post<PrizmEnvelope<AigenticResult>>('run', {
-        header: { kind: ENGINE },
-        data: { prompt: EXTRACT_PROMPT, inline, outputFormat: 'json' },
-      });
-      const g = parseGraph(env?.data?.output ?? '');
+      const result = await askRoom(apiFor, { prompt: EXTRACT_PROMPT, inline: roomGrounding(docs), outputFormat: 'json' });
+      const g = parseGraph(result.output ?? '');
       if (!g || g.nodes.length === 0) {
         ui.toast({ title: t('presentr.diagramNoResult'), variant: 'info' });
         return;

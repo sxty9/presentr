@@ -18,7 +18,7 @@ import {
   useLiveQuery,
   useT,
   type ServiceContextProps,
-} from '@holisdk/ui';
+} from '@holistic/ui';
 import type { DocsResponse, Document } from '../types';
 
 // The document pool — workflow stage 1. A keyboard-navigable list of the room's documents on the

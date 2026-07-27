@@ -1,4 +1,4 @@
-import { NetworkIcon, type ServicePlugin } from '@holisdk/ui';
+import { NetworkIcon, type ServicePlugin } from '@holistic/ui';
 import { Dashboard } from './Dashboard';
 import './i18n';
 
