@@ -24,20 +24,25 @@ const (
 	service = "presentr"
 	version = "0.1.0"
 
-	maxDocBody = 1 << 20 // 1 MiB cap for a text document submission
+	maxDocBody  = 1 << 20 // 1 MiB cap for a text document submission
+	maxChatBody = 4 << 20 // 4 MiB cap for a full-conversation replace
+	maxMessages = 200     // keep at most the newest N turns of a conversation
+	maxMsgLen   = 100_000 // clamp a single message's text
+	maxLabelLen = 100     // clamp a model/engine label
 )
 
-// Server wires the session verifier and the document pool into HTTP handlers. Further pools
-// (the connection diagram, the chat history) are added here as the workflow is built out.
+// Server wires the session verifier and presentr's passive pools into HTTP handlers. The
+// connection-diagram pool is added here as that stage is built out.
 type Server struct {
-	v    *auth.Verifier
-	docs *store.DocPool
+	v     *auth.Verifier
+	docs  *store.DocPool
+	chats *store.ChatPool
 }
 
-// New builds a server over the session verifier and the document pool (the single access point
-// to the room's knowledge).
-func New(v *auth.Verifier, docs *store.DocPool) *Server {
-	return &Server{v: v, docs: docs}
+// New builds a server over the session verifier and the pools (the single access points to the
+// room's knowledge and the users' conversations with the assistant).
+func New(v *auth.Verifier, docs *store.DocPool, chats *store.ChatPool) *Server {
+	return &Server{v: v, docs: docs, chats: chats}
 }
 
 type handler func(w http.ResponseWriter, r *http.Request, u *auth.User)
@@ -54,6 +59,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+base+"docs", s.guard(rights.GroupUse, true, s.addDoc))
 	mux.HandleFunc("GET "+base+"docs/{id}", s.guard(rights.GroupUse, false, s.getDoc))
 	mux.HandleFunc("DELETE "+base+"docs/{id}", s.guard(rights.GroupUse, true, s.deleteDoc))
+
+	// The room assistant's conversation (workflow stage 3), persisted per user so a reload lands
+	// back in the same session. The assistant itself runs in aigentic; presentr keeps only the
+	// transcript. GET reads the caller's conversation; PUT replaces it (CSRF on the write).
+	mux.HandleFunc("GET "+base+"chats", s.guard(rights.GroupUse, false, s.getChats))
+	mux.HandleFunc("PUT "+base+"chats", s.guard(rights.GroupUse, true, s.putChats))
 
 	mux.HandleFunc("GET "+base+"health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -164,6 +175,71 @@ func (s *Server) deleteDoc(w http.ResponseWriter, r *http.Request, _ *auth.User)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// getChats returns the caller's conversation with the room assistant. Owner-scoped: a user only
+// ever reads their own transcript.
+func (s *Server) getChats(w http.ResponseWriter, _ *http.Request, u *auth.User) {
+	writeJSON(w, http.StatusOK, map[string]any{"messages": s.chats.History(u.Username)})
+}
+
+// putChats replaces the caller's conversation. The full transcript is submitted by the UI after
+// each turn (the assistant is stateless per call). Every record is authored and clamped HERE —
+// outside the passive pool — before being handed over: roles are whitelisted, text and labels are
+// bounded, creation time is stamped when missing, and the history is capped to the newest turns.
+func (s *Server) putChats(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	var body struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Text    string `json:"text"`
+			Model   string `json:"model"`
+			Engine  string `json:"engine"`
+			Created int64  `json:"created"`
+		} `json:"messages"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxChatBody)).Decode(&body); err != nil && err != io.EOF {
+		writeErr(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	msgs := body.Messages
+	if len(msgs) > maxMessages {
+		msgs = msgs[len(msgs)-maxMessages:] // keep the newest turns
+	}
+	out := make([]store.Message, 0, len(msgs))
+	for _, m := range msgs {
+		if m.Role != "user" && m.Role != "assistant" {
+			continue
+		}
+		text := strings.TrimSpace(m.Text)
+		if text == "" {
+			continue
+		}
+		if len(text) > maxMsgLen {
+			text = text[:maxMsgLen]
+		}
+		created := m.Created
+		if created == 0 {
+			created = time.Now().Unix()
+		}
+		out = append(out, store.Message{
+			Role: m.Role, Text: text, Model: clip(m.Model, maxLabelLen), Engine: clip(m.Engine, maxLabelLen), Created: created,
+		})
+	}
+	if err := s.chats.Replace(u.Username, out); err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not save the conversation")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "messages": out})
+}
+
+// clip trims a label to at most n bytes (assistant model/engine tags come from an upstream service,
+// so bound them before storing).
+func clip(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

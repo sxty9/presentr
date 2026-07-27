@@ -46,8 +46,17 @@ registerMessages({
       'The wiring diagram is derived from the {count} documents in the pool. Automatic generation is being built.',
 
     // Chat tab (the assistant — routed through aigentic)
-    'presentr.chatSoonTitle': 'Room assistant',
-    'presentr.chatSoon':
-      'Ask questions about the room and get answers grounded in the documents and the diagram. Powered by the shared aigentic assistant; being wired up next.',
+    'presentr.chatHeading': 'Room assistant',
+    'presentr.chatSubtitle': 'Grounded in the document pool. Answers are labelled with the model that produced them.',
+    'presentr.chatPlaceholder': 'Ask about the room — e.g. “How do I connect my laptop to the projector?”',
+    'presentr.chatSend': 'Send',
+    'presentr.chatThinking': 'Thinking…',
+    'presentr.chatEmpty': '(no answer)',
+    'presentr.chatFailed': 'The assistant could not answer',
+    'presentr.chatEmptyTitle': 'Ask the room assistant',
+    'presentr.chatEmptyBody': 'Ask anything about the room. Answers are grounded in the documents you added in the Docs tab.',
+    'presentr.chatClear': 'Clear',
+    'presentr.chatClearTitle': 'Clear conversation',
+    'presentr.chatClearConfirm': 'Delete this conversation? This cannot be undone.',
   },
 });

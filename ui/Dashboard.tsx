@@ -56,7 +56,7 @@ export function Dashboard({ user, api, apiFor, nav, ui }: ServiceContextProps) {
       <SegmentedControl options={options} value={active} onChange={(v) => nav.navigate(v)} />
       {active === 'docs' && <DocsTab api={api} ui={ui} />}
       {active === 'connection' && <ConnectionTab api={api} />}
-      {active === 'chat' && <ChatTab api={api} apiFor={apiFor} user={user} ui={ui} />}
+      {active === 'chat' && <ChatTab api={api} apiFor={apiFor} ui={ui} />}
     </Stack>
   );
 }

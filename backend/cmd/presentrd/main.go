@@ -40,9 +40,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("presentrd: open document pool: %v", err)
 	}
+	chats, err := store.OpenChats(filepath.Join(dataRoot, "chats.json"))
+	if err != nil {
+		log.Fatalf("presentrd: open chat pool: %v", err)
+	}
 
 	srv := &http.Server{
-		Handler:           api.New(v, docs).Handler(),
+		Handler:           api.New(v, docs, chats).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
