@@ -62,3 +62,36 @@ export interface PrizmEnvelope<T> {
   data: T;
 }
 
+// ── connection diagram (backend internal/store) ──────────────────────────────────────────────
+export interface DiagramPort {
+  id: string;
+  name: string;
+}
+export interface DiagramNode {
+  id: string;
+  name: string;
+  symbol: string;
+  x: number;
+  y: number;
+  ports: DiagramPort[];
+}
+export interface DiagramEdge {
+  id: string;
+  from: string;
+  fromPort: string;
+  to: string;
+  toPort: string;
+  label?: string;
+}
+export interface DiagramGraph {
+  nodes: DiagramNode[];
+  edges: DiagramEdge[];
+}
+// GET/PUT diagram — the current graph plus which state it is in.
+export interface DiagramView extends DiagramGraph {
+  state: 'document' | 'manual';
+  modified: boolean;
+  sourceKey: string;
+  generated: number;
+}
+

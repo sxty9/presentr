@@ -40,10 +40,29 @@ registerMessages({
     'presentr.deleteConfirm': 'Remove this document from the room pool? This cannot be undone.',
     'presentr.deleteFailed': 'Could not delete the document',
 
-    // Connection tab (the auto-generated wiring diagram — generation lands next)
-    'presentr.diagramSoonTitle': 'Connection diagram',
-    'presentr.diagramSoon':
-      'The wiring diagram is derived from the {count} documents in the pool. Automatic generation is being built.',
+    // Connection tab (the wiring diagram, derived from the documents and editable by hand)
+    'presentr.diagramHeading': 'Connection diagram',
+    'presentr.stateDocument': 'Document state',
+    'presentr.stateManual': 'Manually modified',
+    'presentr.restore': 'Restore document state',
+    'presentr.addDevice': 'Add device',
+    'presentr.generate': 'Generate from documents',
+    'presentr.diagramEmptyTitle': 'No diagram yet',
+    'presentr.diagramEmptyBody': 'Generate the diagram from your documents, or add devices by hand and connect their ports.',
+    'presentr.ports': 'ports',
+    'presentr.deleteDevice': 'Delete device',
+    'presentr.deleteConnection': 'Delete connection',
+    'presentr.connectHint': 'Now click a port on another device to connect them.',
+    'presentr.deviceName': 'Name',
+    'presentr.deviceNamePlaceholder': 'e.g. Projector',
+    'presentr.deviceSymbol': 'Symbol',
+    'presentr.devicePorts': 'Number of ports',
+    'presentr.add': 'Add',
+    'presentr.diagramNeedDocs': 'Add some documents first — the diagram is derived from them.',
+    'presentr.diagramNoResult': 'The assistant could not derive a diagram from the documents.',
+    'presentr.diagramGenFailed': 'Could not generate the diagram',
+    'presentr.diagramSaveFailed': 'Could not save the diagram',
+    'presentr.diagramRestoreFailed': 'Could not restore the diagram',
 
     // Chat tab (the assistant — routed through aigentic)
     'presentr.chatHeading': 'Room assistant',

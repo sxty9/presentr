@@ -44,9 +44,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("presentrd: open chat pool: %v", err)
 	}
+	diagram, err := store.OpenDiagram(filepath.Join(dataRoot, "diagram.json"))
+	if err != nil {
+		log.Fatalf("presentrd: open diagram pool: %v", err)
+	}
 
 	srv := &http.Server{
-		Handler:           api.New(v, docs, chats).Handler(),
+		Handler:           api.New(v, docs, chats, diagram).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

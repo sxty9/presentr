@@ -35,13 +35,20 @@ Browser ── https://<host> (Caddy, same-origin) ─┐
 
 This repository is built out in committed, always-runnable steps.
 
-- **Done — foundation:** the full holistic-service skeleton (backend `presentrd`, the passive
-  atomic document pool, the rights interface, the `service` CLI, `CLAUDE.md`), and the 3-tab UI
-  shell with a **working Docs tab** (add text, list with keyboard navigation, Markdown preview,
-  delete). Builds, vets, tests; the UI typechecks and passes the service lint lockdown.
-- **Next:** the Chat tab (aigentic), then the Connection diagram (generation + editable canvas
-  + document/manual states), then the scheme-backed pool and the config / consumption / storage
-  / MCP interfaces. See `CLAUDE.md` and the in-repo tasks.
+- **Done — all three tabs.**
+  - *Docs:* add text, keyboard-navigable list, Markdown preview, delete — over a passive,
+    atomic document pool.
+  - *Chat:* the room assistant, every turn routed through aigentic, answers labelled with their
+    model, conversation persisted per user (same session after a reload).
+  - *Connection:* the wiring diagram — generate it from the documents via aigentic, or build it
+    by hand (drag devices, click ports to connect, add/remove); the first manual edit flips it to
+    "manually modified" and the document-derived state stays one click away (Restore).
+- **Next:** the **scheme**-backed document pool (behind a build tag, with the pure-Go pool as the
+  default) and the remaining holistic interfaces (config / consumption / storage / MCP), plus
+  file upload in Docs. See `CLAUDE.md` and the in-repo tasks.
+
+Everything builds, vets and tests; the UI typechecks against the SDK and passes the service lint
+lockdown; each stage is covered by an end-to-end smoke test.
 
 ## Local development
 
