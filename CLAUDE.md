@@ -29,8 +29,10 @@ pool), **Connection** (the diagram derived from it), **Chat** (the assistant ove
   records and reaches the passive pools through their single access points. Add routes here.
 - `backend/internal/store/` — presentr's data pools. `atomic.go` holds the ONE atomic-write
   primitive + the shared `pool` base every pool reuses (temp→fsync→rename, one mutex,
-  rollback-on-failed-save). `docs.go` is the room's document pool. New pools (the diagram, the
-  chat history) are added here as passive stores and reach the api via one access point each.
+  rollback-on-failed-save). `docs.go`/`chat.go`/`diagram.go` are the passive pools; each reaches
+  the api via one access point. The document pool is fronted by the `DocStore` interface
+  (`docstore.go`), with two backends chosen at build time: the pure-Go JSON pool
+  (`docstore_json.go`, default) and scheme (`docstore_scheme.go`, `//go:build scheme`).
 - `backend/internal/rights/` — the `hp_presentr_use` group constant; mirrors `permissions/presentr.json`.
 - `ui/index.tsx` — default-exports the `ServicePlugin`; `id` MUST equal the manifest `service`.
   Imports `./i18n` for its registration side-effect.
@@ -48,10 +50,12 @@ pool), **Connection** (the diagram derived from it), **Chat** (the assistant ove
   UI: `apiFor('aigentic').post('run', { header: { kind }, data })`. From the backend (background
   regeneration on behalf of a user): `POST /api/services/aigentic/internal/run` with the shared
   internal secret. Degrades gracefully when aigentic is absent.
-- **scheme** — the intended production backend for the document pool: a mutable, path-addressed
-  document store (Rust, consumed via a cgo binding behind `//go:build scheme`). The default build
-  is pure-Go (the JSON pool in `store/`), so the service always builds and runs; the scheme
-  backend is an install-time choice, mirroring aigentic's graveyard-with-fallback pattern.
+- **scheme** — the production backend for the document pool: a mutable, path-addressed document
+  store (Rust), consumed in-process via a cgo binding to its C ABI, behind `//go:build scheme`
+  (`docstore_scheme.go`). Each document is one described file at `documents/<id>` (scheme requires
+  a description on every node). The default build is pure-Go (the JSON pool), so the service always
+  builds and runs with no toolchain; scheme is a build-time choice (`-tags scheme`, CGO, the sibling
+  `libscheme_ffi.a`) — mirroring how aigentic embeds scheme.
 
 ## Rules
 
@@ -70,8 +74,11 @@ pool), **Connection** (the diagram derived from it), **Chat** (the assistant ove
 ## Verify (from the repo root)
 
 ```bash
-# Backend
+# Backend (default pure-Go pool)
 (cd backend && go build ./... && go vet ./... && go test ./...)
+
+# Backend with the scheme document backend (needs the sibling scheme repo + libscheme_ffi.a built)
+(cd backend && CGO_ENABLED=1 go build -tags scheme ./...)
 
 # Rights manifest
 python3 ../holistic/services/dashboard/lib/holistic-perms.py validate ./permissions

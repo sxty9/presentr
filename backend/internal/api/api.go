@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -41,17 +42,19 @@ const (
 	maxCoord   = 20000 // clamp a canvas coordinate
 )
 
-// Server wires the session verifier and presentr's passive pools into HTTP handlers.
+// Server wires the session verifier and presentr's passive pools into HTTP handlers. The document
+// pool is held as an interface so the backend (pure-Go JSON or scheme) is a build-time choice the
+// api layer is blind to.
 type Server struct {
 	v       *auth.Verifier
-	docs    *store.DocPool
+	docs    store.DocStore
 	chats   *store.ChatPool
 	diagram *store.DiagramPool
 }
 
 // New builds a server over the session verifier and the pools (the single access points to the
 // room's knowledge, its connection diagram and the users' conversations with the assistant).
-func New(v *auth.Verifier, docs *store.DocPool, chats *store.ChatPool, diagram *store.DiagramPool) *Server {
+func New(v *auth.Verifier, docs store.DocStore, chats *store.ChatPool, diagram *store.DiagramPool) *Server {
 	return &Server{v: v, docs: docs, chats: chats, diagram: diagram}
 }
 
@@ -124,13 +127,17 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request, u *auth.User) {
 	})
 }
 
-// listDocs returns the room's documents. The pool hands back a consistent snapshot in storage
-// order; newest-first is a presentation choice, made here, outside the passive pool.
+// listDocs returns the room's documents, newest first. Ordering is a presentation choice, made here
+// in the api layer over the snapshot the passive pool hands back — never inside the pool, and never
+// assuming the backend's storage order (scheme lists by path, the JSON pool by insertion).
 func (s *Server) listDocs(w http.ResponseWriter, _ *http.Request, _ *auth.User) {
 	docs := s.docs.List()
-	for i, j := 0, len(docs)-1; i < j; i, j = i+1, j-1 {
-		docs[i], docs[j] = docs[j], docs[i]
-	}
+	sort.SliceStable(docs, func(i, j int) bool {
+		if docs[i].Created != docs[j].Created {
+			return docs[i].Created > docs[j].Created
+		}
+		return docs[i].ID > docs[j].ID
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"docs": docs})
 }
 

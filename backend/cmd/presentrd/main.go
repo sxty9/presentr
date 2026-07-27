@@ -36,7 +36,9 @@ func main() {
 	// The room's document pool: the single access point to the knowledge presentr owns.
 	// `service setup` provisions the data dir and marks it writable in the unit (ReadWritePaths).
 	dataRoot := getenv("PRESENTR_DATA", "/var/lib/presentr")
-	docs, err := store.OpenDocs(filepath.Join(dataRoot, "docs.json"))
+	// The document backend is a build-time choice: the pure-Go JSON pool by default, or scheme when
+	// built with `-tags scheme` (NewDocStore is provided by the matching build-tagged file).
+	docs, err := store.NewDocStore(dataRoot)
 	if err != nil {
 		log.Fatalf("presentrd: open document pool: %v", err)
 	}

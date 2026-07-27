@@ -43,9 +43,11 @@ This repository is built out in committed, always-runnable steps.
   - *Connection:* the wiring diagram — generate it from the documents via aigentic, or build it
     by hand (drag devices, click ports to connect, add/remove); the first manual edit flips it to
     "manually modified" and the document-derived state stays one click away (Restore).
-- **Next:** the **scheme**-backed document pool (behind a build tag, with the pure-Go pool as the
-  default) and the remaining holistic interfaces (config / consumption / storage / MCP), plus
-  file upload in Docs. See `CLAUDE.md` and the in-repo tasks.
+- **Done — scheme backend:** the document pool is fronted by a `DocStore` interface with two
+  build-time backends — the pure-Go JSON pool (default) and **scheme** (`-tags scheme`), which
+  stores each document as a described file in a scheme tree via its cgo C ABI.
+- **Next:** the remaining holistic interfaces (config / consumption / storage / MCP) and file
+  upload in Docs. See `CLAUDE.md` and the in-repo tasks.
 
 Everything builds, vets and tests; the UI typechecks against the SDK and passes the service lint
 lockdown; each stage is covered by an end-to-end smoke test.
