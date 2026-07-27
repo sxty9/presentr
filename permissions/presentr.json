@@ -1,0 +1,20 @@
+{
+  "service": "presentr",
+  "version": 1,
+  "categories": [
+    {
+      "id": "room",
+      "label": "Presentation room",
+      "description": "Access to the presentation-room tutor: the document pool, the connection diagram and the assistant.",
+      "permissions": [
+        {
+          "id": "use",
+          "label": "Use presentr",
+          "description": "Open the presentation-room tutor: read and grow the document pool, view and edit the connection diagram, and ask the assistant.",
+          "group": "hp_presentr_use",
+          "default": false
+        }
+      ]
+    }
+  ]
+}

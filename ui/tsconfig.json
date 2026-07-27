@@ -1,0 +1,11 @@
+{
+  "//": "Editor/standalone typecheck convenience. Assumes holisdk + holistic are siblings (../../holisdk, ../../holistic). The authoritative checks are holistic's lint:services + vite build over frontend/external/presentr.",
+  "extends": "../../holisdk/tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@holisdk/ui": ["../../holisdk/ui/src/index.ts"]
+    }
+  },
+  "include": ["."]
+}

@@ -1,0 +1,34 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs
+*.log
+logs/
+
+# Build artifacts
+dist/
+build/
+bin/
+node_modules/
+*.out
+coverage/
+
+# Frontend plugin link target + transient typecheck links (see CLAUDE.md → Verify)
+external/
+
+# Mercury run scaffolding (task attachments / context — never part of the service)
+.mercury/
