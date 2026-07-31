@@ -24,15 +24,26 @@ pool), **Connection** (the diagram derived from it), **Chat** (the assistant ove
   follows the uniform Holistic-CLI standard.
 - `backend/internal/auth/auth.go` — shared-JWT (`h_access`) validation, live OS group/admin
   resolution, CSRF. Service-agnostic; taken verbatim from the template — reuse as-is.
-- `backend/internal/api/api.go` — the HTTP surface under `/api/services/presentr/`. This is the
-  ONLY place policy lives: it authenticates, enforces the right, stamps identity/time onto
-  records and reaches the passive pools through their single access points. Add routes here.
+- `backend/internal/api/` — the HTTP surface under `/api/services/presentr/`. This is the ONLY
+  place policy lives: it authenticates, enforces the right, stamps identity/time onto records and
+  reaches the passive pools through their single access points. Add routes in `api.go`. `files.go`
+  handles file uploads into the pool (`POST docs` multipart) + serving a file's bytes back
+  (`GET docs/{id}/raw`), accepting only the kinds aigentic can read (images/PDF/text) and rejecting
+  the rest with a reason. `ask.go` is the ONE server-side room-AI access point: it assembles the
+  grounding from the whole pool (text inline; files base64 with their media type) and forwards the
+  turn to aigentic on the caller's behalf (`POST ask`).
+- `backend/internal/aigentic/` — presentr's thin client for aigentic's internal M2M `run` endpoint
+  (shared-secret auth, subject resolved to live rights), mirroring hosuto's peer client. Disabled
+  (no URL/secret) leaves the assistant reporting "not configured" rather than failing the daemon.
 - `backend/internal/store/` — presentr's data pools. `atomic.go` holds the ONE atomic-write
   primitive + the shared `pool` base every pool reuses (temp→fsync→rename, one mutex,
   rollback-on-failed-save). `docs.go`/`chat.go`/`diagram.go` are the passive pools; each reaches
-  the api via one access point. The document pool is fronted by the `DocStore` interface
+  the api via one access point. A document is EITHER typed text (its markdown inline in `Content`)
+  or an uploaded file (its raw bytes kept out of band via `AddFile`/`Bytes`, so `List`/`Get` stay
+  metadata-only — Portionierte Daten). The document pool is fronted by the `DocStore` interface
   (`docstore.go`), with two backends chosen at build time: the pure-Go JSON pool
-  (`docstore_json.go`, default) and scheme (`docstore_scheme.go`, `//go:build scheme`).
+  (`docstore_json.go`, default) and scheme (`docstore_scheme.go`, `//go:build scheme`); both carry
+  the file bytes.
 - `backend/internal/rights/` — the `hp_presentr_use` group constant; mirrors `permissions/presentr.json`.
 - `ui/index.tsx` — default-exports the `ServicePlugin`; `id` MUST equal the manifest `service`.
   Imports `./i18n` for its registration side-effect.
@@ -40,20 +51,22 @@ pool), **Connection** (the diagram derived from it), **Chat** (the assistant ove
   active tab lives in `nav.path`, so a browser reload lands on the same tab (Zustandserhalt).
 - `ui/tabs/` — one file per tab (`DocsTab`, `ConnectionTab`, `ChatTab`). Each renders **only**
   `@holisdk/ui`, resolves every string via `useT()`.
-- `ui/roomAI.ts` — the ONE access point to the room's AI. Both the Chat tab and the Connection
-  diagram ground the model in the same source (the document pool) and speak the same aigentic
-  `/run` envelope, so `roomGrounding()` + `askRoom()` live here once instead of being re-derived
-  per tab. The aigentic contract is mirrored in `types.ts`, never imported.
+- `ui/roomAI.ts` — the UI-side access point to the room's AI: a thin client of presentr's own
+  `POST ask` endpoint. Both the Chat tab and the Connection diagram call `askRoom(api, …)` with only
+  a prompt + output shape; the backend does the grounding (the pool's text AND uploaded files), so
+  file bytes never round-trip out to the browser and back.
 - `ui/i18n.ts` — the `registerMessages()` catalog (en-US; nightly adds the other locales). Owns
   the localized `service.presentr` sidebar label and all UI strings.
 
 ## Building blocks (consumed, not vendored)
 
-- **aigentic** — the shared AI service. The Chat tab and the diagram generator route AI through
-  it (the "Ask AI" standard); every answer is labelled with the model that produced it. From the
-  UI: `apiFor('aigentic').post('run', { header: { kind }, data })`. From the backend (background
-  regeneration on behalf of a user): `POST /api/services/aigentic/internal/run` with the shared
-  internal secret. Degrades gracefully when aigentic is absent.
+- **aigentic** — the shared AI service. The room assistant and the diagram extraction route AI
+  through it (the "Ask AI" standard); every answer is labelled with the model that produced it.
+  presentr calls it FROM THE BACKEND on the caller's behalf — `POST
+  /api/services/aigentic/internal/run` with the shared internal secret (`backend/internal/aigentic`)
+  — because the grounding includes uploaded files whose bytes must reach aigentic (it reads images
+  as vision, PDFs as documents, text inline). Wired via runtime config (`PRESENTR_AIGENTIC_URL` +
+  `AIGENTIC_INTERNAL_SECRET[_FILE]`); degrades gracefully (assistant "not configured") when absent.
 - **scheme** — the production backend for the document pool: a mutable, path-addressed document
   store (Rust), consumed in-process via a cgo binding to its C ABI, behind `//go:build scheme`
   (`docstore_scheme.go`). Each document is one described file at `documents/<id>` (scheme requires
