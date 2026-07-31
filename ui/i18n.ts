@@ -21,9 +21,14 @@ registerMessages({
 
     // Docs tab
     'presentr.docsHeading': 'Document pool',
-    'presentr.docsSubtitle': 'Everything known about the room — manuals, notes, the layout.',
-    'presentr.addDoc': 'Add text',
-    'presentr.noDocs': 'No documents yet. Add what you know about the room.',
+    'presentr.docsSubtitle': 'Everything known about the room — manuals, photos, notes, the layout.',
+    'presentr.addText': 'Write text',
+    'presentr.uploadFiles': 'Upload files',
+    'presentr.openFile': 'Open',
+    'presentr.dropHint': 'Drop files to add them to the room.',
+    'presentr.uploadPartial': 'Some files were not added',
+    'presentr.uploadFailed': 'Could not upload the files',
+    'presentr.noDocs': 'No documents yet. Add what you know about the room — text, PDFs, photos.',
     'presentr.selectDoc': 'Select a document to read it.',
     'presentr.byAuthor': 'Added by {author}',
     'presentr.docTitle': 'Title',

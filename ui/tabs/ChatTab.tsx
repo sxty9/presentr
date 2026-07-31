@@ -18,13 +18,13 @@ import {
   type ServiceContextProps,
 } from '@holisdk/ui';
 import type { ChatHistory, ChatMessage, DocsResponse } from '../types';
-import { askRoom, roomGrounding } from '../roomAI';
+import { askRoom } from '../roomAI';
 
 // The room assistant — the heart of presentr. The user asks questions and the assistant answers as
-// an explainer, grounded in the document pool (and, in a following step, the connection diagram).
-// Per the holistic "Ask AI" standard the AI runs in the shared aigentic service (via
-// apiFor('aigentic')); presentr only persists the transcript so a reload returns to the same
-// session. Every assistant answer is labelled with the model that produced it.
+// an explainer, grounded in the document pool (text AND uploaded PDFs/images). Per the holistic
+// "Ask AI" standard the AI runs in the shared aigentic service; presentr's backend grounds each turn
+// in the pool and routes it there (POST ask), so this tab sends only the prompt and persists the
+// transcript for reload continuity. Every assistant answer is labelled with the model that produced it.
 
 // The assistant's role, sent as prompt guidance (not a user-facing string — it is model input).
 const PREAMBLE =
@@ -37,7 +37,7 @@ const NO_DOCS_NOTE =
   'Note: the document pool is currently empty, so you have no room-specific context yet. Answer ' +
   'generally and suggest what information should be added to the Docs tab.';
 
-export function ChatTab({ api, apiFor, ui }: Pick<ServiceContextProps, 'api' | 'apiFor' | 'ui'>) {
+export function ChatTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
   const t = useT();
   const docsQ = useLiveQuery<DocsResponse>(() => api.get<DocsResponse>('docs'), 15000);
   const [messages, setMessages] = useState<ChatMessage[] | null>(null); // null while loading
@@ -76,7 +76,9 @@ export function ChatTab({ api, apiFor, ui }: Pick<ServiceContextProps, 'api' | '
       const docs = docsQ.data?.docs ?? [];
       const transcript = convo.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`).join('\n\n');
       const prompt = `${PREAMBLE}\n\n${docs.length === 0 ? NO_DOCS_NOTE + '\n\n' : ''}${transcript}\n\nAssistant:`;
-      const result = await askRoom(apiFor, { prompt, inline: roomGrounding(docs), outputFormat: 'markdown' });
+      // The backend grounds the turn in the whole pool (text AND uploaded files) — the UI sends only
+      // the prompt and the requested shape.
+      const result = await askRoom(api, { prompt, outputFormat: 'markdown' });
       const answer: ChatMessage = {
         role: 'assistant',
         text: (result.output || '').trim() || t('presentr.chatEmpty'),
