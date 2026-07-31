@@ -8,6 +8,7 @@ package api
 // the bytes ride out of band via AddFile. Reading them back for a preview goes through getRaw.
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,13 +22,24 @@ import (
 )
 
 const (
-	// A single file is capped well under aigentic's 32 MiB per-request ceiling so several documents
-	// plus the prompt still fit when the assistant grounds an answer in the whole pool.
-	maxFileBytes = 20 << 20
-	// One upload batch (drag-and-drop / multi-select) is bounded as a whole, and by count, so a
-	// stray folder drop cannot exhaust memory or the pool.
-	maxUploadBody  = 40 << 20
+	// maxFileBytes is THE upload limit: the most one file may weigh. It is deliberately coupled to
+	// the grounding path, not free-standing — ask.go budgets maxGroundingBytes (24 MiB of raw bytes)
+	// across the WHOLE pool, and that budget base64-inflates by 4/3 to ~32 MiB on the wire, exactly
+	// aigentic's per-request ceiling. A file heavier than this could never be fully read as room
+	// knowledge, so accepting it would be dishonest. Raising it would require aigentic's ceiling to
+	// rise AND a chunking strategy for large PDFs — out of this task's scope. The UI names this limit
+	// at the entry point and rejects an over-limit file before a byte is sent (a convenience); the
+	// server stays the authority.
+	maxFileBytes   = 20 << 20
 	maxUploadFiles = 20
+	// maxUploadBody FOLLOWS from the per-file limit and the file count (one number, not two): the
+	// largest legitimate batch is maxUploadFiles files each at maxFileBytes, plus a small allowance
+	// for the multipart envelope (boundaries/headers). Because it can never be smaller than a single
+	// allowed file, a normally-oversized single file is parsed in full and then turned away with the
+	// NAMED per-file reason below — the browser reads a complete response, not a stream the server
+	// aborted mid-upload. The whole-body reader is thus a last-resort backstop against a body larger
+	// than any legitimate batch, and that case answers a named 413 rather than an abrupt close.
+	maxUploadBody = maxUploadFiles*maxFileBytes + (1 << 20)
 )
 
 // acceptedImages are the raster formats aigentic reads via vision. pdf and text are handled
@@ -46,6 +58,16 @@ var acceptedImages = map[string]bool{
 func (s *Server) uploadFiles(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBody)
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		// A body larger than the largest legitimate batch trips the whole-body reader. Answer with a
+		// named 413 so the rejection ARRIVES as a readable response document, instead of the generic
+		// error that reads as a torn stream. (The UI rejects an over-limit file before sending, so a
+		// real user never reaches this; it is the honest backstop for anything that slips past.)
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+				"This upload is too large — each file may be up to %d MB, and at most %d files at once", maxFileBytes>>20, maxUploadFiles))
+			return
+		}
 		writeErr(w, http.StatusBadRequest, "Could not read the uploaded files")
 		return
 	}
@@ -73,7 +95,7 @@ func (s *Server) uploadFiles(w http.ResponseWriter, r *http.Request, u *auth.Use
 			continue
 		}
 		if fh.Size > maxFileBytes {
-			rejected = append(rejected, rejection{name, fmt.Sprintf("larger than the %d MiB limit", maxFileBytes>>20)})
+			rejected = append(rejected, rejection{name, fmt.Sprintf("%d MB is over the %d MB limit for one file", fh.Size>>20, maxFileBytes>>20)})
 			continue
 		}
 		f, err := fh.Open()
@@ -92,7 +114,7 @@ func (s *Server) uploadFiles(w http.ResponseWriter, r *http.Request, u *auth.Use
 			continue
 		}
 		if len(data) > maxFileBytes {
-			rejected = append(rejected, rejection{name, fmt.Sprintf("larger than the %d MiB limit", maxFileBytes>>20)})
+			rejected = append(rejected, rejection{name, fmt.Sprintf("%d MB is over the %d MB limit for one file", len(data)>>20, maxFileBytes>>20)})
 			continue
 		}
 
