@@ -69,8 +69,13 @@ func (s *Server) Handler() http.Handler {
 	// The document pool (workflow stage 1). Reading and writing both require the presentr
 	// right; writes additionally carry the CSRF double-submit guard.
 	mux.HandleFunc("GET "+base+"docs", s.guard(rights.GroupUse, false, s.listDocs))
+	// POST docs is the ONE way into the pool for BOTH kinds of knowledge: a JSON body writes a typed
+	// text document; a multipart body uploads one or more files. addDoc routes on the content type,
+	// so the two are one access point, not similar siblings.
 	mux.HandleFunc("POST "+base+"docs", s.guard(rights.GroupUse, true, s.addDoc))
 	mux.HandleFunc("GET "+base+"docs/{id}", s.guard(rights.GroupUse, false, s.getDoc))
+	// The raw bytes of a file document, for the SDK viewers (image/PDF preview). Read-only.
+	mux.HandleFunc("GET "+base+"docs/{id}/raw", s.guard(rights.GroupUse, false, s.getRaw))
 	mux.HandleFunc("DELETE "+base+"docs/{id}", s.guard(rights.GroupUse, true, s.deleteDoc))
 
 	// The room assistant's conversation (workflow stage 3), persisted per user so a reload lands
@@ -151,10 +156,15 @@ func (s *Server) getDoc(w http.ResponseWriter, r *http.Request, _ *auth.User) {
 	writeJSON(w, http.StatusOK, d)
 }
 
-// addDoc appends a text document to the shared room pool. Identity, kind, size and creation time
-// are stamped HERE, outside the passive pool — every such evaluation lives in this layer. The
-// append is atomic: it lands whole or leaves the pool untouched.
+// addDoc grows the shared room pool. A multipart body is a file upload (handled in files.go); a
+// JSON body is a typed text document, appended here. Either way identity, kind, mime, size and
+// creation time are stamped HERE, outside the passive pool — every such evaluation lives in this
+// layer — and the write is atomic: it lands whole or leaves the pool untouched.
 func (s *Server) addDoc(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		s.uploadFiles(w, r, u)
+		return
+	}
 	var body struct {
 		Title       string `json:"title"`
 		Content     string `json:"content"`
