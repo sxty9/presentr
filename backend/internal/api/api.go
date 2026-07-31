@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"presentr/internal/aigentic"
 	"presentr/internal/auth"
 	"presentr/internal/rights"
 	"presentr/internal/store"
@@ -50,12 +51,15 @@ type Server struct {
 	docs    store.DocStore
 	chats   *store.ChatPool
 	diagram *store.DiagramPool
+	ai      *aigentic.Client // the room's AI, reached on the caller's behalf; nil/disabled => /ask 503s
 }
 
 // New builds a server over the session verifier and the pools (the single access points to the
-// room's knowledge, its connection diagram and the users' conversations with the assistant).
-func New(v *auth.Verifier, docs store.DocStore, chats *store.ChatPool, diagram *store.DiagramPool) *Server {
-	return &Server{v: v, docs: docs, chats: chats, diagram: diagram}
+// room's knowledge, its connection diagram and the users' conversations with the assistant). ai is
+// the client for the room's AI (aigentic); a nil or unconfigured client leaves /ask reporting the
+// assistant as unavailable, and the UI degrades gracefully.
+func New(v *auth.Verifier, docs store.DocStore, chats *store.ChatPool, diagram *store.DiagramPool, ai *aigentic.Client) *Server {
+	return &Server{v: v, docs: docs, chats: chats, diagram: diagram, ai: ai}
 }
 
 type handler func(w http.ResponseWriter, r *http.Request, u *auth.User)
@@ -83,6 +87,11 @@ func (s *Server) Handler() http.Handler {
 	// transcript. GET reads the caller's conversation; PUT replaces it (CSRF on the write).
 	mux.HandleFunc("GET "+base+"chats", s.guard(rights.GroupUse, false, s.getChats))
 	mux.HandleFunc("PUT "+base+"chats", s.guard(rights.GroupUse, true, s.putChats))
+
+	// The room's AI — the ONE server-side access point that grounds an AI turn in the whole document
+	// pool (text AND uploaded files) and forwards it to aigentic on the caller's behalf. Both the
+	// Chat tab and the Connection diagram derive from it. Right-gated + CSRF (it spends AI budget).
+	mux.HandleFunc("POST "+base+"ask", s.guard(rights.GroupUse, true, s.ask))
 
 	// The connection diagram (workflow stage 2). GET reads the current graph + whether it is the
 	// document-derived state or manually modified. PUT replaces the current graph (a manual edit).

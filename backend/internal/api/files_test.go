@@ -23,9 +23,9 @@ func newServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The upload/raw handlers reach only the document pool; the verifier and the other pools are
-	// exercised through the guard, which these tests call the handlers beneath.
-	return New(nil, docs, nil, nil)
+	// The upload/raw handlers reach only the document pool; the verifier, aigentic client and the
+	// other pools are exercised through the guard, which these tests call the handlers beneath.
+	return New(nil, docs, nil, nil, nil)
 }
 
 func user() *auth.User { return &auth.User{Username: "ada", Groups: []string{"hp_presentr_use"}} }

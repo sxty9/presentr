@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"presentr/internal/aigentic"
 	"presentr/internal/api"
 	"presentr/internal/auth"
 	"presentr/internal/store"
@@ -51,8 +52,18 @@ func main() {
 		log.Fatalf("presentrd: open diagram pool: %v", err)
 	}
 
+	// The room's AI runs in the shared aigentic service. presentr reaches it on the caller's behalf
+	// through aigentic's internal M2M endpoint (no browser session in a background call), grounding
+	// each turn in the document pool. The base URL and the shared internal secret are runtime config,
+	// never baked in; an absent secret leaves the client disabled and the assistant degrades to
+	// "not configured" rather than failing the daemon.
+	ai := aigentic.New(
+		getenv("PRESENTR_AIGENTIC_URL", "http://127.0.0.1:8780"),
+		aigenticSecret(),
+	)
+
 	srv := &http.Server{
-		Handler:           api.New(v, docs, chats, diagram).Handler(),
+		Handler:           api.New(v, docs, chats, diagram, ai).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -84,4 +95,20 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// aigenticSecret reads aigentic's shared internal secret the same way aigentic itself does:
+// AIGENTIC_INTERNAL_SECRET, else the file it points at via AIGENTIC_INTERNAL_SECRET_FILE. Empty =>
+// the room-AI client stays disabled, so the feature is inert until a deployment provisions the
+// secret (the daemon runs unchanged; the assistant reports "not configured").
+func aigenticSecret() string {
+	if v := os.Getenv("AIGENTIC_INTERNAL_SECRET"); v != "" {
+		return v
+	}
+	if p := os.Getenv("AIGENTIC_INTERNAL_SECRET_FILE"); p != "" {
+		if b, err := os.ReadFile(p); err == nil {
+			return string(b)
+		}
+	}
+	return ""
 }
