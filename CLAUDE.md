@@ -27,11 +27,17 @@ pool), **Connection** (the diagram derived from it), **Chat** (the assistant ove
 - `backend/internal/api/` — the HTTP surface under `/api/services/presentr/`. This is the ONLY
   place policy lives: it authenticates, enforces the right, stamps identity/time onto records and
   reaches the passive pools through their single access points. Add routes in `api.go`. `files.go`
-  handles file uploads into the pool (`POST docs` multipart) + serving a file's bytes back
-  (`GET docs/{id}/raw`), accepting only the kinds aigentic can read (images/PDF/text) and rejecting
-  the rest with a reason. `ask.go` is the ONE server-side room-AI access point: it assembles the
-  grounding from the whole pool (text inline; files base64 with their media type) and forwards the
-  turn to aigentic on the caller's behalf (`POST ask`).
+  handles file uploads into the pool (`POST docs` multipart, up to 100 MB per file — read as a STREAM
+  and stored to disk as it arrives, never buffered whole) + streaming a file's bytes back
+  (`GET docs/{id}/raw`, via `http.ServeContent` so a big file is not held in memory and range
+  requests work), accepting only the kinds aigentic can read (images/PDF/text) and rejecting the
+  rest — or an over-limit file — with a NAMED reason, never a torn stream. `ask.go` is the ONE
+  server-side room-AI access point: it assembles the grounding from the whole pool (text inline;
+  files base64 with their media type) bounded by aigentic's per-request ceiling, NAMES any document
+  too large to include so the answer discloses what it could not read, and forwards the turn to
+  aigentic on the caller's behalf (`POST ask`). Splitting a large document into question-relevant
+  sections (RAG) is a capability aigentic does not yet have; presentr names the gap, it does not
+  re-implement retrieval locally.
 - `backend/internal/aigentic/` — presentr's thin client for aigentic's internal M2M `run` endpoint
   (shared-secret auth, subject resolved to live rights), mirroring hosuto's peer client. Disabled
   (no URL/secret) leaves the assistant reporting "not configured" rather than failing the daemon.
@@ -39,11 +45,13 @@ pool), **Connection** (the diagram derived from it), **Chat** (the assistant ove
   primitive + the shared `pool` base every pool reuses (temp→fsync→rename, one mutex,
   rollback-on-failed-save). `docs.go`/`chat.go`/`diagram.go` are the passive pools; each reaches
   the api via one access point. A document is EITHER typed text (its markdown inline in `Content`)
-  or an uploaded file (its raw bytes kept out of band via `AddFile`/`Bytes`, so `List`/`Get` stay
-  metadata-only — Portionierte Daten). The document pool is fronted by the `DocStore` interface
-  (`docstore.go`), with two backends chosen at build time: the pure-Go JSON pool
-  (`docstore_json.go`, default) and scheme (`docstore_scheme.go`, `//go:build scheme`); both carry
-  the file bytes.
+  or an uploaded file (its raw bytes kept out of band, STREAMED in via `AddFile` — a 100 MB upload
+  never sits whole in memory — read back bounded via `Bytes` for the AI grounding or streamed via
+  `OpenBlob` for download, so `List`/`Get` stay metadata-only — Portionierte Daten). The document
+  pool is fronted by the `DocStore` interface (`docstore.go`), with two backends chosen at build
+  time: the pure-Go JSON pool (`docstore_json.go`, default; streams file bytes straight to a blob
+  file) and scheme (`docstore_scheme.go`, `//go:build scheme`; its FFI takes a whole buffer, so a
+  large file transiently costs its size in memory there); both carry the file bytes.
 - `backend/internal/rights/` — the `hp_presentr_use` group constant; mirrors `permissions/presentr.json`.
 - `ui/index.tsx` — default-exports the `ServicePlugin`; `id` MUST equal the manifest `service`.
   Imports `./i18n` for its registration side-effect.
