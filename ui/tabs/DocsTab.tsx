@@ -30,7 +30,7 @@ import {
   type ServiceContextProps,
   type TextPayload,
   type ViewerKind,
-} from '@holisdk/ui';
+} from '@holistic/ui';
 import type { DocsResponse, Document, UploadResponse } from '../types';
 
 // The document pool — workflow stage 1. It takes in the room's knowledge three equal ways, exactly
@@ -77,6 +77,24 @@ interface UploadItem {
 const ACCEPT_HINT =
   'image/png,image/jpeg,image/gif,image/webp,application/pdf,text/*,.md,.markdown,.csv,.json,.log,.yaml,.yml,.toml,.ini';
 
+// Open the OS file dialog as an ACTION, not a rendered surface. A service UI composes only
+// @holistic/ui components and renders no raw element — not even a hidden <input> — so the picker is
+// built on demand inside the click handler, opened, and its chosen files read back. The opening is a
+// Handlung, not a Fläche. (The SDK's UploadControl renders its OWN button + a folder option, which
+// would duplicate this tab's single "Add" access point and offer a folder upload presentr does not
+// take — so it does not fit here; Keine ähnlichen Geschwister.)
+function openFileDialog(accept: string, onFiles: (files: File[]) => void) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.multiple = true;
+  input.accept = accept;
+  input.onchange = () => {
+    const files = Array.from(input.files ?? []);
+    if (files.length) onFiles(files);
+  };
+  input.click();
+}
+
 // formatSize renders a byte count the way a user reads it — "70 MB", "1.4 MB" — for the rejection
 // message, so a turned-away file shows its actual weight next to the limit.
 function formatSize(bytes: number): string {
@@ -109,7 +127,6 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
   const [busy, setBusy] = useState(false);
 
   const [dragging, setDragging] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // The live per-file upload rows and a ref mirror of them, so the sequential queue runner and the
   // cancel handler can read the current status without going stale between renders.
@@ -316,18 +333,6 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
             {t('presentr.docsSubtitle')}
           </Text>
         </Stack>
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          accept={ACCEPT_HINT}
-          className="hidden"
-          onChange={(e) => {
-            const files = Array.from(e.target.files ?? []);
-            e.target.value = '';
-            if (files.length) enqueue(files);
-          }}
-        />
         <Stack gap={1} align="end">
           <DropdownMenu
             align="end"
@@ -338,7 +343,7 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
             }
             items={[
               { id: 'text', label: t('presentr.addText'), icon: <FileTextIcon />, onSelect: () => setAdding(true) },
-              { id: 'files', label: t('presentr.uploadFiles'), icon: <UploadIcon />, onSelect: () => fileInputRef.current?.click() },
+              { id: 'files', label: t('presentr.uploadFiles'), icon: <UploadIcon />, onSelect: () => openFileDialog(ACCEPT_HINT, enqueue) },
             ]}
           />
           {/* The access point names what it accepts — kinds and size — so the limit is known before it

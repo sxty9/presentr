@@ -10,7 +10,7 @@ import {
   userHasRight,
   type SegmentedOption,
   type ServiceContextProps,
-} from '@holisdk/ui';
+} from '@holistic/ui';
 import { DocsTab } from './tabs/DocsTab';
 import { ConnectionTab } from './tabs/ConnectionTab';
 import { ChatTab } from './tabs/ChatTab';
