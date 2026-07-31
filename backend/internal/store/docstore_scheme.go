@@ -30,8 +30,13 @@ import (
 	"unsafe"
 )
 
-// docPrefix is the folder under which every document lives in the scheme tree.
-const docPrefix = "documents"
+// docPrefix is the folder under which every document's metadata lives in the scheme tree; blobPrefix
+// holds the raw bytes of file documents, one node per document (kept out of the metadata a List
+// walks — Portionierte Daten). Both live in the same store, reached through this one access point.
+const (
+	docPrefix  = "documents"
+	blobPrefix = "blobs"
+)
 
 // NewDocStore returns the scheme-backed document backend (selected because this file's `scheme`
 // build tag is active). The store lives in a "scheme" subdirectory of the service's data dir.
@@ -95,7 +100,51 @@ func (s *SchemeDocs) Add(d Document) error {
 	path := docPrefix + "/" + d.ID
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.putLocked(path, desc, data)
+}
 
+// AddFile stores a file document as two described nodes: its raw bytes at blobs/<id> and its
+// metadata at documents/<id>. The bytes are written FIRST, so the document only becomes observable
+// (in List/Get) once the metadata node exists — a reader never sees a file entry whose bytes are
+// missing (Atomare Zugriffe). The metadata carries no inline bytes; Bytes reaches the blob node.
+func (s *SchemeDocs) AddFile(d Document, data []byte) error {
+	meta, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+	desc := strings.TrimSpace(d.Description)
+	if desc == "" {
+		desc = strings.TrimSpace(d.Title)
+	}
+	if desc == "" {
+		desc = "(no description)"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.putLocked(blobPrefix+"/"+d.ID, desc, data); err != nil {
+		return err
+	}
+	return s.putLocked(docPrefix+"/"+d.ID, desc, meta)
+}
+
+// Bytes returns the raw bytes of a file document (its blobs/<id> node). Absence (a text document or
+// an unknown id) reports found=false.
+func (s *SchemeDocs) Bytes(id string) ([]byte, bool) {
+	if id == "" {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok, err := s.getBytes(blobPrefix + "/" + id)
+	if err != nil || !ok {
+		return nil, false
+	}
+	return b, true
+}
+
+// putLocked writes one described node at path (caller holds s.mu). scheme requires a non-empty
+// description on every node, so desc must already be non-empty.
+func (s *SchemeDocs) putLocked(path, desc string, data []byte) error {
 	cpath := C.CBytes([]byte(path))
 	defer C.free(cpath)
 	cdesc := C.CBytes([]byte(desc))
@@ -154,11 +203,20 @@ func (s *SchemeDocs) List() []Document {
 	return out
 }
 
-// Delete removes a document. scheme delete is idempotent — a missing id is not an error.
+// Delete removes a document: its metadata node first (making it invisible), then its blob node.
+// scheme delete is idempotent — a missing node is not an error, so a text document (no blob) and a
+// crash between the two deletes both resolve cleanly.
 func (s *SchemeDocs) Delete(id string) error {
-	path := docPrefix + "/" + id
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.deleteLocked(docPrefix + "/" + id); err != nil {
+		return err
+	}
+	return s.deleteLocked(blobPrefix + "/" + id)
+}
+
+// deleteLocked removes one node at path (caller holds s.mu). Idempotent.
+func (s *SchemeDocs) deleteLocked(path string) error {
 	cpath := C.CBytes([]byte(path))
 	defer C.free(cpath)
 	if st := C.scheme_delete(s.h, (*C.char)(cpath), C.size_t(len(path)), nil); st != C.SCHEME_OK {

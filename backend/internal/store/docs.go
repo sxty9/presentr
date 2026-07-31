@@ -26,8 +26,8 @@ type Document struct {
 	Kind        string `json:"kind"`        // "text" | "file"
 	Mime        string `json:"mime"`        // e.g. "text/markdown", "application/pdf"
 	Description string `json:"description"` // short human summary of what this item is
-	Content     string `json:"content"`     // inline text for kind=="text" (files store bytes out of band)
-	Size        int64  `json:"size"`        // byte length of the item's content
+	Content     string `json:"content"`     // inline text for kind=="text" (files store bytes out of band, reached via Bytes)
+	Size        int64  `json:"size"`        // byte length of the item's content (text runes or file bytes)
 	Author      string `json:"author"`      // who added it (stamped by the api layer)
 	Created     int64  `json:"created"`     // epoch seconds (stamped by the api layer)
 }
@@ -38,13 +38,17 @@ type docState struct {
 }
 
 // DocPool is the atomic, in-memory-cached persistence for the room's documents. The daemon is
-// the only writer, so one mutex is the whole concurrency story.
+// the only writer, so one mutex is the whole concurrency story. Typed-text documents live entirely
+// in docs.json (their markdown inline); an uploaded file's raw bytes live out of band as one file
+// per document under blobDir, so the metadata list a poll walks stays small (Portionierte Daten).
 type DocPool struct {
-	path string
+	path    string
+	blobDir string
 	pool[docState]
 }
 
-// OpenDocs loads the document pool from path. A missing file means "no documents yet".
+// OpenDocs loads the document pool from path. A missing file means "no documents yet". Uploaded
+// file bytes are kept in a "blobs" directory beside the metadata file.
 func OpenDocs(path string) (*DocPool, error) {
 	if path == "" {
 		path = "/var/lib/presentr/docs.json"
@@ -52,7 +56,7 @@ func OpenDocs(path string) (*DocPool, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	p := &DocPool{path: path}
+	p := &DocPool{path: path, blobDir: filepath.Join(filepath.Dir(path), "blobs")}
 	p.st = docState{Docs: []Document{}}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -109,11 +113,41 @@ func (p *DocPool) Add(d Document) error {
 	return err
 }
 
+// AddFile stores a file document: its raw bytes are written out of band FIRST (atomically), then
+// the metadata record is appended (atomically). The document only becomes observable once the
+// metadata append lands, so a reader never sees a file entry whose bytes are missing; a crash
+// between the two leaves only an orphan blob (invisible, harmless). A failed metadata append
+// removes the just-written blob so nothing is left behind.
+func (p *DocPool) AddFile(d Document, data []byte) error {
+	blob := filepath.Join(p.blobDir, d.ID)
+	if _, err := atomicWrite(blob, data); err != nil {
+		return err
+	}
+	if err := p.Add(d); err != nil {
+		_ = os.Remove(blob) // roll back the orphan blob; best-effort
+		return err
+	}
+	return nil
+}
+
+// Bytes returns the raw bytes of a file document. A missing blob (a text document, or an unknown
+// id) reports found=false.
+func (p *DocPool) Bytes(id string) ([]byte, bool) {
+	if id == "" {
+		return nil, false
+	}
+	b, err := os.ReadFile(filepath.Join(p.blobDir, id))
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
 // Delete removes the document with the given id. Missing id is a no-op (idempotent). Atomic:
-// a failed persist restores the prior slice, so a rejected delete leaves no observable trace.
+// a failed persist restores the prior slice, so a rejected delete leaves no observable trace. The
+// metadata is removed first (making the document invisible); its blob is then dropped best-effort.
 func (p *DocPool) Delete(id string) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	prev := p.st.Docs
 	next := make([]Document, 0, len(prev))
 	for _, d := range prev {
@@ -122,12 +156,17 @@ func (p *DocPool) Delete(id string) error {
 		}
 	}
 	if len(next) == len(prev) {
+		p.mu.Unlock()
 		return nil
 	}
 	p.st.Docs = next
 	committed, err := p.persist(p.path)
 	if err != nil && !committed {
 		p.st.Docs = prev
+	}
+	p.mu.Unlock()
+	if err == nil {
+		_ = os.Remove(filepath.Join(p.blobDir, id)) // drop the blob once the metadata is gone
 	}
 	return err
 }

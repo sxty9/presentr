@@ -187,3 +187,71 @@ func TestFsyncDir(t *testing.T) {
 		t.Fatal("fsyncDir returned nil for a missing directory; a failed seal must not look sealed")
 	}
 }
+
+// addFile builds a file record outside the pool (as the api layer does) and stores it with its raw
+// bytes via the passive AddFile.
+func addFile(t *testing.T, p *DocPool, id, name, mime string, data []byte) Document {
+	t.Helper()
+	d := Document{
+		ID: id, Title: name, Kind: "file", Mime: mime,
+		Description: name, Size: int64(len(data)), Author: "ada", Created: time.Now().Unix(),
+	}
+	if err := p.AddFile(d, data); err != nil {
+		t.Fatalf("AddFile: %v", err)
+	}
+	return d
+}
+
+// A file document's bytes round-trip out of band: the metadata lists it (with no inline content),
+// Bytes hands back exactly the stored bytes, and a reopened pool still finds both.
+func TestAddFileRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data", "docs.json")
+	p, err := OpenDocs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x00, 0xff}
+	d := addFile(t, p, "img1", "layout.png", "image/png", raw)
+
+	got, ok := p.Bytes(d.ID)
+	if !ok || string(got) != string(raw) {
+		t.Fatalf("Bytes(%s) = %v, %v; want the stored bytes", d.ID, got, ok)
+	}
+	// Metadata carries no inline bytes — the list stays small.
+	list := p.List()
+	if len(list) != 1 || list[0].Content != "" || list[0].Kind != "file" {
+		t.Fatalf("List after AddFile = %+v; want one file with empty inline content", list)
+	}
+
+	p2, err := OpenDocs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := p2.Bytes(d.ID); !ok || string(got) != string(raw) {
+		t.Fatalf("after reopen Bytes(%s) = %v, %v; want the stored bytes", d.ID, got, ok)
+	}
+}
+
+// Deleting a file document drops both its metadata and its bytes; Bytes on a text document or an
+// unknown id reports not-found rather than erroring.
+func TestDeleteFileRemovesBytes(t *testing.T) {
+	p := openDocs(t)
+	d := addFile(t, p, "f1", "manual.pdf", "application/pdf", []byte("%PDF-1.7\n..."))
+	text := addDoc(t, p, "note", "hello")
+
+	if _, ok := p.Bytes(text.ID); ok {
+		t.Fatal("a text document must carry no bytes")
+	}
+	if _, ok := p.Bytes("nope"); ok {
+		t.Fatal("an unknown id must report not-found")
+	}
+	if err := p.Delete(d.ID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, ok := p.Bytes(d.ID); ok {
+		t.Fatal("Bytes still found after Delete; the blob must be gone")
+	}
+	if _, ok := p.Get(d.ID); ok {
+		t.Fatal("metadata still present after Delete")
+	}
+}
