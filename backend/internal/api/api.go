@@ -27,11 +27,8 @@ const (
 	version = "0.1.0"
 
 	maxDocBody     = 1 << 20 // 1 MiB cap for a text document submission
-	maxChatBody    = 4 << 20 // 4 MiB cap for a full-conversation replace
+	maxChatBody    = 4 << 20 // 4 MiB cap for the whole conversation list of one owner
 	maxDiagramBody = 4 << 20 // 4 MiB cap for a whole-diagram replace
-	maxMessages    = 200     // keep at most the newest N turns of a conversation
-	maxMsgLen      = 100_000 // clamp a single message's text
-	maxLabelLen    = 100     // clamp a model/engine label
 
 	maxNodes   = 200   // clamp the number of devices in a diagram
 	maxEdges   = 600   // clamp the number of connections
@@ -222,59 +219,39 @@ func (s *Server) deleteDoc(w http.ResponseWriter, r *http.Request, _ *auth.User)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// getChats returns the caller's conversation with the room assistant. Owner-scoped: a user only
-// ever reads their own transcript.
+// getChats returns the caller's conversations with the room assistant, verbatim — one opaque JSON
+// blob (a list of conversations) whose shape the UI's ChatAdapter owns. Owner-scoped: a user only
+// ever reads their own conversations. Always valid JSON ("[]" when there are none).
 func (s *Server) getChats(w http.ResponseWriter, _ *http.Request, u *auth.User) {
-	writeJSON(w, http.StatusOK, map[string]any{"messages": s.chats.History(u.Username)})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(s.chats.Blob(u.Username))
 }
 
-// putChats replaces the caller's conversation. The full transcript is submitted by the UI after
-// each turn (the assistant is stateless per call). Every record is authored and clamped HERE —
-// outside the passive pool — before being handed over: roles are whitelisted, text and labels are
-// bounded, creation time is stamped when missing, and the history is capped to the newest turns.
+// putChats replaces the caller's whole conversation list. The room assistant is the ONE shared
+// chat building block (@holisdk/ui <Chat>), which owns the conversation shape and re-sends the
+// full list after each change — so the payload is opaque to the backend, exactly as aigentic's is.
+// Policy still lives HERE, outside the passive pool: this layer bounds the size and validates the
+// blob is a JSON array before handing it over; the pool only stores the bytes. An empty body clears
+// the caller's conversations.
 func (s *Server) putChats(w http.ResponseWriter, r *http.Request, u *auth.User) {
-	var body struct {
-		Messages []struct {
-			Role    string `json:"role"`
-			Text    string `json:"text"`
-			Model   string `json:"model"`
-			Engine  string `json:"engine"`
-			Created int64  `json:"created"`
-		} `json:"messages"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxChatBody)).Decode(&body); err != nil && err != io.EOF {
-		writeErr(w, http.StatusBadRequest, "Invalid request body")
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxChatBody))
+	if err != nil {
+		writeErr(w, http.StatusRequestEntityTooLarge, "The conversation history is too large")
 		return
 	}
-	msgs := body.Messages
-	if len(msgs) > maxMessages {
-		msgs = msgs[len(msgs)-maxMessages:] // keep the newest turns
+	if len(body) > 0 {
+		var probe []json.RawMessage
+		if err := json.Unmarshal(body, &probe); err != nil {
+			writeErr(w, http.StatusBadRequest, "Invalid conversation data")
+			return
+		}
 	}
-	out := make([]store.Message, 0, len(msgs))
-	for _, m := range msgs {
-		if m.Role != "user" && m.Role != "assistant" {
-			continue
-		}
-		text := strings.TrimSpace(m.Text)
-		if text == "" {
-			continue
-		}
-		if len(text) > maxMsgLen {
-			text = text[:maxMsgLen]
-		}
-		created := m.Created
-		if created == 0 {
-			created = time.Now().Unix()
-		}
-		out = append(out, store.Message{
-			Role: m.Role, Text: text, Model: clip(m.Model, maxLabelLen), Engine: clip(m.Engine, maxLabelLen), Created: created,
-		})
-	}
-	if err := s.chats.Replace(u.Username, out); err != nil {
+	if err := s.chats.Save(u.Username, body); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not save the conversation")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "messages": out})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // diagramView is the shape the UI reads: the current graph plus which state it is in and the

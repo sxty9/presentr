@@ -1,6 +1,8 @@
 package store
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,17 +17,19 @@ func openChats(t *testing.T) *ChatPool {
 	return p
 }
 
-// A conversation must round-trip through disk unchanged and stay owner-scoped.
+// A conversation blob must round-trip through disk byte-for-byte and stay owner-scoped.
 func TestChatsPersistAndIsolate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data", "chats.json")
 	p, err := OpenChats(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Replace("ada", []Message{{Role: "user", Text: "hi", Created: 1}, {Role: "assistant", Text: "hello", Model: "m", Engine: "e", Created: 2}}); err != nil {
+	ada := json.RawMessage(`[{"id":"c1","title":"hi","messages":[{"role":"user","content":"hi"}]}]`)
+	grace := json.RawMessage(`[{"id":"g1","title":"hers","messages":[{"role":"user","content":"hers"}]}]`)
+	if err := p.Save("ada", ada); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Replace("grace", []Message{{Role: "user", Text: "hers", Created: 1}}); err != nil {
+	if err := p.Save("grace", grace); err != nil {
 		t.Fatal(err)
 	}
 
@@ -33,51 +37,62 @@ func TestChatsPersistAndIsolate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ada := p2.History("ada")
-	if len(ada) != 2 || ada[0].Text != "hi" || ada[1].Model != "m" {
-		t.Fatalf("ada's conversation did not survive reload: %+v", ada)
+	// The blob round-trips semantically (the on-disk file is pretty-printed, so bytes may be
+	// re-indented; the UI parses JSON either way).
+	if got := compact(t, p2.Blob("ada")); got != string(ada) {
+		t.Fatalf("ada's conversations did not survive reload: %s", got)
 	}
-	if g := p2.History("grace"); len(g) != 1 || g[0].Text != "hers" {
-		t.Fatalf("owner isolation broke on reload: %+v", g)
-	}
-}
-
-// History returns [] not nil for an unknown owner (so it serialises as [], never null), and hands
-// back a copy that cannot mutate the pool.
-func TestChatsHistoryEmptyAndCopied(t *testing.T) {
-	p := openChats(t)
-	got := p.History("nobody")
-	if got == nil || len(got) != 0 {
-		t.Fatalf("History for an unknown owner must be an empty, non-nil slice, got: %#v", got)
-	}
-	if err := p.Replace("ada", []Message{{Role: "user", Text: "one", Created: 1}}); err != nil {
-		t.Fatal(err)
-	}
-	h := p.History("ada")
-	h[0].Text = "tampered"
-	if again := p.History("ada"); again[0].Text != "one" {
-		t.Fatalf("History handed out a reference into the live snapshot: %+v", again)
+	if got := compact(t, p2.Blob("grace")); got != string(grace) {
+		t.Fatalf("owner isolation broke on reload: %s", got)
 	}
 }
 
-// Replacing with an empty slice clears the owner and drops the key — no ghost survives.
-func TestChatsReplaceEmptyClears(t *testing.T) {
+// compact strips insignificant whitespace so a re-indented blob can be compared to its source.
+func compact(t *testing.T, b json.RawMessage) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, b); err != nil {
+		t.Fatalf("blob is not valid JSON: %v (%s)", err, b)
+	}
+	return buf.String()
+}
+
+// Blob returns "[]" (never null) for an unknown owner and hands back a copy that cannot mutate the
+// pool.
+func TestChatsBlobEmptyAndCopied(t *testing.T) {
 	p := openChats(t)
-	if err := p.Replace("ada", []Message{{Role: "user", Text: "one", Created: 1}}); err != nil {
+	got := p.Blob("nobody")
+	if string(got) != "[]" {
+		t.Fatalf("Blob for an unknown owner must be [], got: %s", got)
+	}
+	if err := p.Save("ada", json.RawMessage(`[{"id":"c1","title":"one"}]`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Replace("ada", nil); err != nil {
+	h := p.Blob("ada")
+	h[0] = 'X' // mutate the returned copy
+	if again := p.Blob("ada"); again[0] != '[' {
+		t.Fatalf("Blob handed out a reference into the live snapshot: %s", again)
+	}
+}
+
+// Clearing with an empty array (or nil) drops the owner and leaves no ghost key.
+func TestChatsSaveEmptyClears(t *testing.T) {
+	p := openChats(t)
+	if err := p.Save("ada", json.RawMessage(`[{"id":"c1"}]`)); err != nil {
 		t.Fatal(err)
 	}
-	if got := p.History("ada"); len(got) != 0 {
-		t.Fatalf("cleared conversation still returns messages: %+v", got)
+	if err := p.Save("ada", json.RawMessage(`[]`)); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.Blob("ada"); string(got) != "[]" {
+		t.Fatalf("cleared conversations still return data: %s", got)
 	}
 	if _, ok := p.st.Chats["ada"]; ok {
-		t.Fatalf("cleared conversation left a ghost key: %+v", p.st.Chats)
+		t.Fatalf("cleared conversations left a ghost key: %+v", p.st.Chats)
 	}
 }
 
-// A failed persist must leave the prior conversation exactly as it was (Atomare Zugriffe).
+// A failed persist must leave the prior blob exactly as it was (Atomare Zugriffe).
 func TestChatsFailedSaveRollsBack(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "data")
@@ -86,7 +101,8 @@ func TestChatsFailedSaveRollsBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Replace("ada", []Message{{Role: "user", Text: "keep", Created: 1}}); err != nil {
+	keep := json.RawMessage(`[{"id":"c1","title":"keep"}]`)
+	if err := p.Save("ada", keep); err != nil {
 		t.Fatal(err)
 	}
 
@@ -97,11 +113,10 @@ func TestChatsFailedSaveRollsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := p.Replace("ada", []Message{{Role: "user", Text: "lost", Created: 2}}); err == nil {
-		t.Fatal("Replace succeeded despite a broken write path")
+	if err := p.Save("ada", json.RawMessage(`[{"id":"c1","title":"lost"}]`)); err == nil {
+		t.Fatal("Save succeeded despite a broken write path")
 	}
-	got := p.History("ada")
-	if len(got) != 1 || got[0].Text != "keep" {
-		t.Fatalf("failed save left an observable intermediate state: %+v", got)
+	if got := p.Blob("ada"); string(got) != string(keep) {
+		t.Fatalf("failed save left an observable intermediate state: %s", got)
 	}
 }

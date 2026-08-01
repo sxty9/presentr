@@ -14,5 +14,12 @@ import type { AskRequest, AskResult } from './types';
 // it through aigentic; a disabled/unavailable assistant surfaces as a rejected request the caller
 // reports to the user.
 export async function askRoom(api: ServiceContextProps['api'], req: AskRequest): Promise<AskResult> {
-  return api.post<AskResult>('ask', { prompt: req.prompt, outputFormat: req.outputFormat ?? 'markdown' });
+  return api.post<AskResult>('ask', {
+    prompt: req.prompt,
+    outputFormat: req.outputFormat ?? 'markdown',
+    // The room chat passes the user's machine + model choice; the Connection diagram leaves both
+    // unset and runs on Auto. Empty engine → "choose" on the backend (the Ask-AI default).
+    engine: req.engine,
+    model: req.model,
+  });
 }

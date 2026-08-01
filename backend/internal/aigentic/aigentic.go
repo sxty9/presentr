@@ -40,10 +40,13 @@ type InlineFile struct {
 }
 
 // Req is the subset of aigentic's request presentr sets: the prompt, the requested answer shape, an
-// optional model override, and the room grounding as inline parts.
+// optional engine (aigentic routing kind) and model override, and the room grounding as inline
+// parts. Engine mirrors aigentic's engine kinds (choose/ollama/claude-cli/claude-api); empty means
+// "choose" — aigentic picks the best engine (the Ask-AI standard).
 type Req struct {
 	Prompt       string
 	OutputFormat string // "text" | "markdown" | "json"
+	Engine       string
 	Model        string
 	Inline       []InlineFile
 }
@@ -110,7 +113,14 @@ func (c *Client) Run(ctx context.Context, subject string, req Req) (Res, error) 
 	}
 	var body wireReq
 	body.Subject = subject
-	body.Header.Kind = "choose"
+	// The caller's chosen engine is the routing kind; empty falls back to "choose" (the Ask-AI
+	// standard: aigentic picks the best engine it can offer). aigentic resolves the subject and
+	// dispatches to that kind, so an unknown kind fails there, not silently here.
+	kind := strings.TrimSpace(req.Engine)
+	if kind == "" {
+		kind = "choose"
+	}
+	body.Header.Kind = kind
 	body.Data = data
 	buf, err := json.Marshal(body)
 	if err != nil {
