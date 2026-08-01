@@ -132,14 +132,17 @@ func (s *Server) uploadFiles(w http.ResponseWriter, r *http.Request, u *auth.Use
 			continue
 		}
 		// Author the complete record outside the pool, then stream the bytes over for passive
-		// storage; the pool stamps Size from the bytes it writes and reports an over-limit file.
+		// storage; the pool stamps Size from the bytes it writes and reports an over-limit file. The
+		// document lands in the "pending" read state: its text is read ONCE, right after it arrives (a
+		// background step, see startExtraction below), not on every later question.
 		d := store.Document{
-			ID:      store.NewID(),
-			Title:   name,
-			Kind:    "file",
-			Mime:    mime,
-			Author:  u.Username,
-			Created: time.Now().Unix(),
+			ID:           store.NewID(),
+			Title:        name,
+			Kind:         "file",
+			Mime:         mime,
+			Author:       u.Username,
+			Created:      time.Now().Unix(),
+			ExtractState: "pending",
 		}
 		n, err := s.docs.AddFile(d, io.MultiReader(bytes.NewReader(head), part), maxFileBytes)
 		part.Close()
@@ -156,6 +159,9 @@ func (s *Server) uploadFiles(w http.ResponseWriter, r *http.Request, u *auth.Use
 			continue
 		}
 		d.Size = n
+		// Read the file's text once, now, in the background — the upload answers immediately with the
+		// document in "pending", and the read flips it to ready/failed (surfaced in the list the UI polls).
+		s.startExtraction(d.ID)
 		accepted = append(accepted, d)
 	}
 

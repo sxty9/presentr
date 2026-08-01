@@ -13,6 +13,7 @@ package aigentic
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -97,21 +98,48 @@ type wireReq struct {
 	Data json.RawMessage `json:"data"`
 }
 
-// Run executes one turn on behalf of subject and returns the engine's answer. A missing engine
-// (aigentic 503) maps to ErrUnavailable; any other non-2xx to a generic error carrying aigentic's
-// detail; a transport error (including the context deadline) is returned as-is.
+// Run executes one turn on behalf of subject and returns the engine's answer. It uses aigentic's
+// `choose` router (the "Ask AI" standard: aigentic picks the best engine it can offer). A missing
+// engine (aigentic 503) maps to ErrUnavailable; any other non-2xx to a generic error carrying
+// aigentic's detail; a transport error (including the context deadline) is returned as-is.
 func (c *Client) Run(ctx context.Context, subject string, req Req) (Res, error) {
+	return c.dispatch(ctx, subject, "choose", wireData{
+		Prompt: req.Prompt, OutputFormat: req.OutputFormat, Model: req.Model, Inline: req.Inline,
+	})
+}
+
+// Extract reads the text CONTAINED in one file via aigentic's shared `extract` capability — the ONE
+// place text recognition lives, so presentr never re-implements OCR (Reuse before Build). It reads a
+// PDF's text layer AND the text inside its images, and any image's text (an equipment nameplate, a
+// connector label), returning the transcription plus the engine/model that produced it
+// (Kennzeichnungspflicht). path is provenance only; mediaType tells aigentic how to read the bytes
+// (image → vision, application/pdf → document, text/* → inline text). Binary bytes ride base64; text
+// rides inline, mirroring how the room grounding is assembled (one contract, no second encoding).
+func (c *Client) Extract(ctx context.Context, subject, path, mediaType string, data []byte) (Res, error) {
+	f := InlineFile{Path: path, MediaType: mediaType}
+	if mediaType == "" || strings.HasPrefix(mediaType, "text/") {
+		f.Content = string(data)
+	} else {
+		f.Content = base64.StdEncoding.EncodeToString(data)
+	}
+	return c.dispatch(ctx, subject, "extract", wireData{OutputFormat: "text", Inline: []InlineFile{f}})
+}
+
+// dispatch is the shared body of Run and Extract: it wraps wireData in the internal/run envelope under
+// the given kind, presents the shared secret and the server-authoritative subject, and maps aigentic's
+// outcome to a Res or a typed error. The kind selects aigentic's processor ("choose" | "extract").
+func (c *Client) dispatch(ctx context.Context, subject, kind string, data wireData) (Res, error) {
 	if !c.Enabled() {
 		return Res{}, ErrDisabled
 	}
-	data, err := json.Marshal(wireData{Prompt: req.Prompt, OutputFormat: req.OutputFormat, Model: req.Model, Inline: req.Inline})
+	raw, err := json.Marshal(data)
 	if err != nil {
 		return Res{}, err
 	}
 	var body wireReq
 	body.Subject = subject
-	body.Header.Kind = "choose"
-	body.Data = data
+	body.Header.Kind = kind
+	body.Data = raw
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return Res{}, err

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"presentr/internal/aigentic"
@@ -52,14 +53,28 @@ type Server struct {
 	chats   *store.ChatPool
 	diagram *store.DiagramPool
 	ai      *aigentic.Client // the room's AI, reached on the caller's behalf; nil/disabled => /ask 503s
+	// extractSem bounds how many uploaded files are read (text-layer parse or AI recognition) at once,
+	// so a burst of large uploads cannot spawn unbounded background work. Buffered in New.
+	extractSem chan struct{}
+	// extractWG tracks in-flight background reads so they can be drained (a graceful stop, and a
+	// deterministic test that must not race a temp-dir cleanup).
+	extractWG sync.WaitGroup
 }
+
+// maxConcurrentExtractions caps parallel background reads (see extractSem).
+const maxConcurrentExtractions = 4
 
 // New builds a server over the session verifier and the pools (the single access points to the
 // room's knowledge, its connection diagram and the users' conversations with the assistant). ai is
 // the client for the room's AI (aigentic); a nil or unconfigured client leaves /ask reporting the
-// assistant as unavailable, and the UI degrades gracefully.
+// assistant as unavailable, and the UI degrades gracefully. The same client also reads text out of
+// uploaded images and scans (see extract.go); when it is absent, those reads fail with a named,
+// retriable reason rather than blocking the daemon.
 func New(v *auth.Verifier, docs store.DocStore, chats *store.ChatPool, diagram *store.DiagramPool, ai *aigentic.Client) *Server {
-	return &Server{v: v, docs: docs, chats: chats, diagram: diagram, ai: ai}
+	return &Server{
+		v: v, docs: docs, chats: chats, diagram: diagram, ai: ai,
+		extractSem: make(chan struct{}, maxConcurrentExtractions),
+	}
 }
 
 type handler func(w http.ResponseWriter, r *http.Request, u *auth.User)
@@ -80,6 +95,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+base+"docs/{id}", s.guard(rights.GroupUse, false, s.getDoc))
 	// The raw bytes of a file document, for the SDK viewers (image/PDF preview). Read-only.
 	mux.HandleFunc("GET "+base+"docs/{id}/raw", s.guard(rights.GroupUse, false, s.getRaw))
+	// The derived text read out of a file document (the extract), for the UI to show what the assistant
+	// will actually read. Read-only.
+	mux.HandleFunc("GET "+base+"docs/{id}/extract", s.guard(rights.GroupUse, false, s.getExtract))
+	// Re-run the text read of a file document without re-uploading it — for a read that failed
+	// (no AI, a broken file) once the cause is cleared. Right-gated + CSRF (it spends AI budget).
+	mux.HandleFunc("POST "+base+"docs/{id}/extract", s.guard(rights.GroupUse, true, s.reExtract))
 	mux.HandleFunc("DELETE "+base+"docs/{id}", s.guard(rights.GroupUse, true, s.deleteDoc))
 
 	// The room assistant's conversation (workflow stage 3), persisted per user so a reload lands

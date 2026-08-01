@@ -56,6 +56,22 @@ registerMessages({
     'presentr.deleteConfirm': 'Remove this document from the room pool? This cannot be undone.',
     'presentr.deleteFailed': 'Could not delete the document',
 
+    // Text extraction — the text read once out of an uploaded file (a PDF's text layer, or the text on
+    // a photo/scan, recognized by the assistant), kept beside the file and used to answer questions.
+    'presentr.extractReading': 'Reading text…',
+    'presentr.extractUnread': 'Text not read',
+    'presentr.extractReadHeading': 'Text read from this file',
+    'presentr.extractFromLayer': 'Read from the document’s text layer — exact, no AI used.',
+    'presentr.extractFromAI': 'Text recognized by the assistant (including text on photos and scans), read by {model}.',
+    'presentr.extractPendingBody': 'Reading the text out of this file. This runs once; you can keep working.',
+    'presentr.extractFailedBody': 'The text of this file could not be read. {reason}',
+    'presentr.extractRetry': 'Read again',
+    'presentr.extractRetryFailed': 'Could not start reading the file again',
+    'presentr.extractShow': 'Show the read text',
+    'presentr.extractHide': 'Hide the read text',
+    'presentr.extractEmpty': 'No legible text was found in this file.',
+    'presentr.extractLoadFailed': 'Could not load the read text',
+
     // Connection tab (the wiring diagram, derived from the documents and editable by hand)
     'presentr.diagramHeading': 'Connection diagram',
     'presentr.stateDocument': 'Document state',

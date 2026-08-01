@@ -31,27 +31,47 @@ pool), **Connection** (the diagram derived from it), **Chat** (the assistant ove
   and stored to disk as it arrives, never buffered whole) + streaming a file's bytes back
   (`GET docs/{id}/raw`, via `http.ServeContent` so a big file is not held in memory and range
   requests work), accepting only the kinds aigentic can read (images/PDF/text) and rejecting the
-  rest — or an over-limit file — with a NAMED reason, never a torn stream. `ask.go` is the ONE
-  server-side room-AI access point: it assembles the grounding from the whole pool (text inline;
-  files base64 with their media type) bounded by aigentic's per-request ceiling, NAMES any document
-  too large to include so the answer discloses what it could not read, and forwards the turn to
-  aigentic on the caller's behalf (`POST ask`). Splitting a large document into question-relevant
-  sections (RAG) is a capability aigentic does not yet have; presentr names the gap, it does not
-  re-implement retrieval locally.
+  rest — or an over-limit file — with a NAMED reason, never a torn stream. `extract.go` orchestrates
+  reading a file's TEXT ONCE when it arrives (see `internal/extract`): the upload answers immediately
+  with the document in a `pending` read state and a BACKGROUND read flips it to `ready` (text + source)
+  or `failed` (a retriable reason) — bounded by a worker semaphore, drained via `WaitExtractions`, and
+  resumed on start (`ResumePending`) so a `pending` state always ENDS. `POST docs/{id}/extract` re-runs
+  a failed read from the stored bytes (no re-upload); `GET docs/{id}/extract` returns the read state +
+  text. `ask.go` is the ONE server-side room-AI access point: it grounds an AI turn in the pool using
+  each file's READ TEXT (a few hundred KB), not its raw bytes (up to 100 MB), so a 70 MB manual no
+  longer ships whole on every question; it NAMES every gap — too large to include, not read yet, or a
+  failed read — so the answer discloses what it could not draw on, and forwards the turn to aigentic on
+  the caller's behalf (`POST ask`). Splitting a large READ into question-relevant sections (RAG) is a
+  capability aigentic does not yet have; presentr names the gap and the read text (not the raw bytes)
+  is what that sibling step will chunk — it does not re-implement retrieval locally.
+- `backend/internal/extract/` — the text-read step, OUTSIDE the passive pool (the pool stores the
+  result via `SetExtract`, it never computes it). `extract.go` routes by kind: a text file, and a PDF
+  with a machine-readable text layer AND no embedded image, are read locally and exactly, no AI
+  (`pdf.go`, a small stdlib-only PDF text-layer reader); an image, and any image-bearing or scanned
+  PDF, is handed WHOLE to aigentic's shared `extract` capability, which reads the text layer AND the
+  text INSIDE images (a photographed nameplate, a connector label) — reused, never re-implemented
+  (Reuse before Build). The original file is never altered, downscaled or recompressed; the read text
+  is ADDITIONAL, kept beside it.
 - `backend/internal/aigentic/` — presentr's thin client for aigentic's internal M2M `run` endpoint
-  (shared-secret auth, subject resolved to live rights), mirroring hosuto's peer client. Disabled
-  (no URL/secret) leaves the assistant reporting "not configured" rather than failing the daemon.
+  (shared-secret auth, subject resolved to live rights), mirroring hosuto's peer client. `Run` uses
+  the `choose` router (Ask-AI standard); `Extract` uses aigentic's `extract` capability to read a
+  file's text. Disabled (no URL/secret) leaves the assistant reporting "not configured" and file reads
+  failing with a named, retriable reason rather than failing the daemon.
 - `backend/internal/store/` — presentr's data pools. `atomic.go` holds the ONE atomic-write
   primitive + the shared `pool` base every pool reuses (temp→fsync→rename, one mutex,
   rollback-on-failed-save). `docs.go`/`chat.go`/`diagram.go` are the passive pools; each reaches
   the api via one access point. A document is EITHER typed text (its markdown inline in `Content`)
   or an uploaded file (its raw bytes kept out of band, STREAMED in via `AddFile` — a 100 MB upload
   never sits whole in memory — read back bounded via `Bytes` for the AI grounding or streamed via
-  `OpenBlob` for download, so `List`/`Get` stay metadata-only — Portionierte Daten). The document
-  pool is fronted by the `DocStore` interface (`docstore.go`), with two backends chosen at build
-  time: the pure-Go JSON pool (`docstore_json.go`, default; streams file bytes straight to a blob
-  file) and scheme (`docstore_scheme.go`, `//go:build scheme`; its FFI takes a whole buffer, so a
-  large file transiently costs its size in memory there); both carry the file bytes.
+  `OpenBlob` for download, so `List`/`Get` stay metadata-only — Portionierte Daten). A file document
+  also carries a derived EXTRACT — the text read out of it once at upload — stored the SAME way: the
+  text lives out of band (reached via `ExtractText`) while small state/provenance fields ride the
+  metadata, so it belongs to the same entity through the one access point (no second store), computed
+  OUTSIDE the pool and handed in via `SetExtract` (the pool stays passive). The document pool is
+  fronted by the `DocStore` interface (`docstore.go`), with two backends chosen at build time: the
+  pure-Go JSON pool (`docstore_json.go`, default; streams file bytes straight to a blob file) and
+  scheme (`docstore_scheme.go`, `//go:build scheme`; its FFI takes a whole buffer, so a large file
+  transiently costs its size in memory there); both carry the file bytes AND the extract.
 - `backend/internal/rights/` — the `hp_presentr_use` group constant; mirrors `permissions/presentr.json`.
 - `ui/index.tsx` — default-exports the `ServicePlugin`; `id` MUST equal the manifest `service`.
   Imports `./i18n` for its registration side-effect.
@@ -68,13 +88,16 @@ pool), **Connection** (the diagram derived from it), **Chat** (the assistant ove
 
 ## Building blocks (consumed, not vendored)
 
-- **aigentic** — the shared AI service. The room assistant and the diagram extraction route AI
-  through it (the "Ask AI" standard); every answer is labelled with the model that produced it.
-  presentr calls it FROM THE BACKEND on the caller's behalf — `POST
-  /api/services/aigentic/internal/run` with the shared internal secret (`backend/internal/aigentic`)
-  — because the grounding includes uploaded files whose bytes must reach aigentic (it reads images
-  as vision, PDFs as documents, text inline). Wired via runtime config (`PRESENTR_AIGENTIC_URL` +
-  `AIGENTIC_INTERNAL_SECRET[_FILE]`); degrades gracefully (assistant "not configured") when absent.
+- **aigentic** — the shared AI service. The room assistant, the diagram extraction, and reading the
+  text out of an uploaded file all route AI through it (the "Ask AI" standard); every answer is
+  labelled with the model that produced it. presentr calls it FROM THE BACKEND on the caller's behalf —
+  `POST /api/services/aigentic/internal/run` with the shared internal secret (`backend/internal/aigentic`).
+  Two capabilities are used: `choose` grounds an answer in the pool, and `extract` reads a file's text —
+  including the text INSIDE images (nameplates, labels, scans), which only vision reads. That
+  recognition lives ONCE in aigentic (every document service needs it), so presentr reuses it rather
+  than re-implementing OCR (Reuse before Build); presentr still reads a PDF's plain text layer itself
+  (exact, no AI). Wired via runtime config (`PRESENTR_AIGENTIC_URL` + `AIGENTIC_INTERNAL_SECRET[_FILE]`);
+  degrades gracefully (assistant "not configured", file reads fail with a retriable reason) when absent.
 - **scheme** — the production backend for the document pool: a mutable, path-addressed document
   store (Rust), consumed in-process via a cgo binding to its C ABI, behind `//go:build scheme`
   (`docstore_scheme.go`). Each document is one described file at `documents/<id>` (scheme requires

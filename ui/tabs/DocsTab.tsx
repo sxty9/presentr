@@ -31,7 +31,7 @@ import {
   type TextPayload,
   type ViewerKind,
 } from '@holisdk/ui';
-import type { DocsResponse, Document, UploadResponse } from '../types';
+import type { DocsResponse, Document, ExtractResponse, UploadResponse } from '../types';
 
 // The document pool — workflow stage 1. It takes in the room's knowledge three equal ways, exactly
 // as the axioms require of any surface that holds a collection of files: a picker, drag-and-drop onto
@@ -398,6 +398,8 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
                   onOpen={() => (d.kind === 'file' ? openPreview(d) : setSelectedId(d.id))}
                   onDelete={() => remove(d.id)}
                   deleteLabel={t('presentr.delete')}
+                  readingLabel={t('presentr.extractReading')}
+                  unreadLabel={t('presentr.extractUnread')}
                 />
               ))
             ) : (
@@ -425,6 +427,8 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
                   <Button variant="secondary" onClick={() => openPreview(selected)}>
                     {t('presentr.openFile')}
                   </Button>
+                  <Divider />
+                  <ExtractSection api={api} ui={ui} doc={selected} t={t} onChanged={() => docsQ.refresh()} />
                 </Stack>
               ) : (
                 <Markdown text={selected.content} />
@@ -485,6 +489,8 @@ function DocRow({
   onOpen,
   onDelete,
   deleteLabel,
+  readingLabel,
+  unreadLabel,
 }: {
   doc: Document;
   selected: boolean;
@@ -492,6 +498,8 @@ function DocRow({
   onOpen: () => void;
   onDelete: () => void;
   deleteLabel: string;
+  readingLabel: string;
+  unreadLabel: string;
 }) {
   const entry: FileEntry =
     doc.kind === 'file'
@@ -522,6 +530,18 @@ function DocRow({
           )}
         </Stack>
       </Stack>
+      {/* At-a-glance read state for a file: a file being read, or one whose read failed, shows a badge;
+          a successfully read file needs no attention and shows none (Intuitiv by Design). */}
+      {doc.kind === 'file' && doc.extractState === 'pending' && (
+        <Badge variant="neutral" className="shrink-0">
+          {readingLabel}
+        </Badge>
+      )}
+      {doc.kind === 'file' && doc.extractState === 'failed' && (
+        <Badge variant="danger" className="shrink-0">
+          {unreadLabel}
+        </Badge>
+      )}
       <IconButton
         label={deleteLabel}
         size="sm"
@@ -534,6 +554,126 @@ function DocRow({
         <TrashIcon />
       </IconButton>
     </Stack>
+  );
+}
+
+// The extraction section of a file's detail panel: it shows the ONE named read state and lets the user
+// act on it. Reading shows a quiet "reading…" note (the state ENDS — the list polls and this resolves);
+// a failed read shows why and offers "Read again" (retry from the stored bytes, no re-upload); a
+// finished read names its source (exact text layer, or recognized by a model) and can reveal the text
+// the assistant will actually draw on. A file with no read yet (uploaded before this feature) offers to
+// read it now.
+function ExtractSection({
+  api,
+  ui,
+  doc,
+  t,
+  onChanged,
+}: {
+  api: ServiceApiClient;
+  ui: ServiceContextProps['ui'];
+  doc: Document;
+  t: ReturnType<typeof useT>;
+  onChanged: () => void;
+}) {
+  const [showing, setShowing] = useState(false);
+  const [text, setText] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const state = doc.extractState ?? '';
+
+  // Reset the revealed text when the selected document changes, so it never shows a stale extract.
+  useEffect(() => {
+    setShowing(false);
+    setText(null);
+  }, [doc.id]);
+
+  async function toggle() {
+    if (showing) {
+      setShowing(false);
+      return;
+    }
+    setShowing(true);
+    if (text === null) {
+      setLoading(true);
+      try {
+        const r = await api.get<ExtractResponse>(`docs/${doc.id}/extract`);
+        setText(r.text ?? '');
+      } catch {
+        setText('');
+        ui.toast({ title: t('presentr.extractLoadFailed'), variant: 'error' });
+      } finally {
+        setLoading(false);
+      }
+    }
+  }
+
+  async function retry() {
+    setRetrying(true);
+    try {
+      await api.post(`docs/${doc.id}/extract`, {});
+      setText(null);
+      setShowing(false);
+      onChanged();
+    } catch (e) {
+      ui.toast({ title: t('presentr.extractRetryFailed'), description: (e as Error).message, variant: 'error' });
+    } finally {
+      setRetrying(false);
+    }
+  }
+
+  if (state === 'pending') {
+    return (
+      <Stack gap={1} align="start">
+        <Badge variant="neutral">{t('presentr.extractReading')}</Badge>
+        <Text variant="caption" color="tertiary">
+          {t('presentr.extractPendingBody')}
+        </Text>
+      </Stack>
+    );
+  }
+
+  if (state === 'failed') {
+    return (
+      <Stack gap={2} align="start">
+        <Text color="secondary">{t('presentr.extractFailedBody', { reason: doc.extractError ?? '' })}</Text>
+        <Button variant="secondary" loading={retrying} onClick={retry}>
+          {t('presentr.extractRetry')}
+        </Button>
+      </Stack>
+    );
+  }
+
+  if (state === 'ready') {
+    const source =
+      doc.extractSource === 'ai'
+        ? t('presentr.extractFromAI', { model: doc.extractModel || doc.extractEngine || 'the assistant' })
+        : t('presentr.extractFromLayer');
+    return (
+      <Stack gap={2} align="start" className="w-full">
+        <Text weight="semibold">{t('presentr.extractReadHeading')}</Text>
+        <Text variant="caption" color="tertiary">
+          {source}
+        </Text>
+        <Button variant="ghost" size="sm" onClick={toggle} loading={loading}>
+          {showing ? t('presentr.extractHide') : t('presentr.extractShow')}
+        </Button>
+        {showing && !loading && (
+          <div className="max-h-72 w-full overflow-auto rounded-md bg-fill/5 p-3">
+            <Text variant="footnote" color="secondary" className="whitespace-pre-wrap">
+              {text ? text : t('presentr.extractEmpty')}
+            </Text>
+          </div>
+        )}
+      </Stack>
+    );
+  }
+
+  // No read yet (a file uploaded before this feature): offer to read it now.
+  return (
+    <Button variant="secondary" loading={retrying} onClick={retry}>
+      {t('presentr.extractRetry')}
+    </Button>
   );
 }
 

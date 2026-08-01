@@ -62,8 +62,13 @@ func main() {
 		aigenticSecret(),
 	)
 
+	app := api.New(v, docs, chats, diagram, ai)
+	// Resume reading any file whose upload landed but whose text read did not finish before a previous
+	// stop — so a "reading…" state always ENDS rather than lingering after a restart.
+	app.ResumePending()
+
 	srv := &http.Server{
-		Handler:           api.New(v, docs, chats, diagram, ai).Handler(),
+		Handler:           app.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
