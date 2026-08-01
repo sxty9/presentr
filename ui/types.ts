@@ -19,6 +19,28 @@ export interface Document {
   size: number;
   author: string;
   created: number;
+
+  // Extraction — the text read once out of a file (kind "file") and kept beside it, so questions work
+  // with the text, not the raw bytes. state drives what the UI shows; a file uploaded before this
+  // feature carries an empty state.
+  extractState?: 'pending' | 'ready' | 'failed' | '';
+  extractSource?: string; // "text-layer" (read exactly, no AI) | "ai" (recognized from an image/scan)
+  extractModel?: string; // the AI model that read it, when source is "ai" (Kennzeichnungspflicht)
+  extractEngine?: string;
+  extractError?: string; // why the read failed (state "failed"); a retry can clear it
+  extractSize?: number;
+}
+
+// GET docs/{id}/extract — a file's read state plus the text that was read, so the UI can show exactly
+// what the assistant will draw on.
+export interface ExtractResponse {
+  state: string;
+  source: string;
+  model: string;
+  engine: string;
+  error: string;
+  size: number;
+  text: string;
 }
 
 // GET docs — the room's documents, newest first.
