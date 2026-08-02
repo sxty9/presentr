@@ -80,7 +80,42 @@ type Section struct {
 	Track  string // "image" for an extracted embedded image; "" for a whole-document / page-split / image-file read
 	Page   int    // 1-based source page of an image section (0 when not applicable)
 	Note   string // when set, the section is not sent to the AI; this is the gap it records
+
+	// render, when non-nil, produces this section's Data lazily — the IMAGE-COMPRESSION step for a PDF's
+	// embedded image (decode → downscale to visionLongEdge → JPEG q82). It is deferred out of Prepare so
+	// the caller can show that compression as its OWN visible per-image step, distinct from the AI read of
+	// the same image (the task's per-image compression step). nil for a section whose Data is already
+	// final (a text file, a whole-PDF/page section, an uploaded image file sent as-is).
+	render func() (data []byte, ok bool)
 }
+
+// NeedsCompression reports whether this section's bytes must be produced by the image-compression step
+// (Compress) before it can be read — a PDF's embedded image, deferred so the caller shows it as its own
+// visible step. False for a section whose Data is already final.
+func (s Section) NeedsCompression() bool { return s.render != nil }
+
+// Compress runs the deferred image-compression step and returns the section with its Data filled (a
+// compact JPEG). ok is false for a codec this reader cannot decode (JBIG2, JPEG2000, CCITT fax) — the
+// caller then records that image as a named gap rather than sending a payload it could not shrink (Kein
+// stummes Ausbleiben). budget marks the result TooBig if the compact JPEG still overruns one request
+// (defensive; a downscaled JPEG is far under any real budget).
+func (s Section) Compress(budget int) (Section, bool) {
+	if s.render == nil {
+		return s, true
+	}
+	data, ok := s.render()
+	if !ok {
+		return s, false
+	}
+	s.Data = data
+	s.render = nil
+	s.TooBig = budget > 0 && len(data) > budget
+	return s, true
+}
+
+// UndecodableImageNote is the named gap recorded for a PDF embedded image whose codec this reader cannot
+// decode, so the assembled extract discloses the missing text rather than dropping it silently.
+const UndecodableImageNote = "an embedded image could not be read (an unsupported image format)"
 
 // SectionResult is the outcome of reading one Section: its transcribed text (empty when TooBig, a Note,
 // or on error), the engine/model that read it, and any error. Track/Page/Note/TooBig carry through so
@@ -143,44 +178,30 @@ func Prepare(mime string, data []byte, budget int) (Plan, error) {
 
 // pdfPlan splits a PDF read into its two independent tracks. The text layer, if coherent, is ALWAYS the
 // local track (exact, no AI) — regardless of any embedded images. The embedded images are their own AI
-// track: each is extracted, downscaled and made its own page-labelled section (extractImageSections). A
-// PDF with a text layer but no decodable images is a pure local read; one with both carries both tracks;
-// one with images but no text layer is read from its images alone. Only a PDF with NEITHER a readable
-// text layer NOR any decodable image is handed to the AI whole (pdfSections) — a scan in a codec this
-// reader cannot open, which must still be read rather than lost. A count of images found but not
-// decodable is disclosed as a named gap so those images' text is never silently missing.
+// track: each is located and made its own page-labelled section with a DEFERRED compression step
+// (extractImageSections), so the caller downscales and JPEG-encodes it per image as a visible sub-step. A
+// PDF with a text layer but no image is a pure local read; one with both carries both tracks; one with
+// images but no text layer is read from its images alone. Only a PDF with NEITHER a readable text layer
+// NOR any locatable image is handed to the AI whole (pdfSections) — a scan in a codec this reader cannot
+// open, which must still be read rather than lost. An image whose codec cannot be decoded surfaces as a
+// named gap when its compression step runs, so those images' text is never silently missing.
 func pdfPlan(data []byte, budget int) Plan {
 	text, hasText := pdfTextLayer(data)
-	imgs, skipped, ok := extractImageSections(data, budget)
+	imgs, ok := extractImageSections(data)
 
 	if !hasText {
 		if ok && len(imgs) > 0 {
-			return Plan{Sections: withUndecodedNote(imgs, skipped)}
+			return Plan{Sections: imgs}
 		}
 		// No readable text layer and no decodable image: read the whole document by AI (page-split when
 		// large), so a scan this reader cannot open still reaches vision.
 		return Plan{Sections: pdfSections(data, budget)}
 	}
 
-	// A readable text layer is the exact, free local track — kept whether or not images are present.
-	return Plan{LocalText: text, Source: "text-layer", Sections: withUndecodedNote(imgs, skipped)}
-}
-
-// withUndecodedNote appends a single named-gap section when some embedded images could not be decoded, so
-// the assembled text discloses that those images' text is missing (Kein stummes Ausbleiben). With none
-// skipped it returns the sections unchanged.
-func withUndecodedNote(sections []Section, skipped int) []Section {
-	if skipped <= 0 {
-		return sections
-	}
-	noun := "image"
-	if skipped > 1 {
-		noun = "images"
-	}
-	return append(sections, Section{
-		Track: "image",
-		Note:  fmt.Sprintf("%d embedded %s could not be read (an unsupported image format)", skipped, noun),
-	})
+	// A readable text layer is the exact, free local track — kept whether or not images are present. The
+	// image sections carry a deferred compression step (Compress); an image whose codec cannot be decoded
+	// surfaces as a named gap when that step runs, per image, rather than being tallied up front.
+	return Plan{LocalText: text, Source: "text-layer", Sections: imgs}
 }
 
 // pdfSections turns a PDF that needs AI into one or more sections. A PDF within budget is one section;
@@ -324,6 +345,16 @@ func Run(ctx context.Context, subject, filename, mime string, data []byte, ai AI
 	}
 	results := make([]SectionResult, 0, len(plan.Sections))
 	for _, sec := range plan.Sections {
+		// Compress a deferred image section first (the per-image compression step). An undecodable image
+		// becomes a named gap, never sent to the AI.
+		if sec.NeedsCompression() {
+			compressed, ok := sec.Compress(MaxAIBytes)
+			if !ok {
+				results = append(results, SectionResult{Label: sec.Label, Track: sec.Track, Page: sec.Page, Note: UndecodableImageNote})
+				continue
+			}
+			sec = compressed
+		}
 		r := ReadSection(ctx, ai, subject, filename, sec)
 		if r.Err != nil && !r.TooBig && r.Note == "" && !hasLocal {
 			return Result{}, r.Err // a pure-AI read aborts on a transport/engine error

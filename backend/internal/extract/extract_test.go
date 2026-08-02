@@ -110,14 +110,18 @@ func TestRunFlatePDFTextLayer(t *testing.T) {
 // a 15-megabyte sensor frame no longer ships whole.
 func TestEmbeddedImageIsDownscaledForVision(t *testing.T) {
 	pdf := rgbImagePDF(t, "spec sheet", 2400, 60) // a wide image, long edge 2400 > the 1568 cap
-	secs, skipped, ok := extractImageSections(pdf, 20<<20)
-	if !ok || len(secs) != 1 || skipped != 0 {
-		t.Fatalf("expected one decodable image section, got ok=%v n=%d skipped=%d", ok, len(secs), skipped)
+	secs, ok := extractImageSections(pdf)
+	if !ok || len(secs) != 1 {
+		t.Fatalf("expected one image section, got ok=%v n=%d", ok, len(secs))
 	}
-	if secs[0].Mime != "image/jpeg" {
-		t.Fatalf("a downscaled image must be sent as JPEG, got %q", secs[0].Mime)
+	if secs[0].Mime != "image/jpeg" || !secs[0].NeedsCompression() {
+		t.Fatalf("an image section must be a deferred JPEG-compression step, got mime=%q needsCompression=%v", secs[0].Mime, secs[0].NeedsCompression())
 	}
-	img, err := jpeg.Decode(bytes.NewReader(secs[0].Data))
+	sec, dok := secs[0].Compress(20 << 20)
+	if !dok {
+		t.Fatalf("the image must decode and compress")
+	}
+	img, err := jpeg.Decode(bytes.NewReader(sec.Data))
 	if err != nil {
 		t.Fatalf("the section must be a valid JPEG: %v", err)
 	}

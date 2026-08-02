@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 
 	"presentr/internal/aigentic"
@@ -52,23 +53,22 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	}
 
 	inline, gaps := s.roomGrounding(prompt)
-	if note := groundingNote(gaps); note != "" {
-		// The grounding is not the whole pool: some documents were too large to include, and some
-		// files have not been read yet or could not be read. Rather than let the model answer as if it
-		// had seen everything (a silent, dishonest gap), tell it plainly what it did NOT receive, so
-		// its answer can name what it is — and is not — based on (EHRLICH BLEIBEN).
-		inline = append([]aigentic.InlineFile{{
-			Path:      "grounding-note",
-			MediaType: "text/markdown",
-			Content:   note,
-		}}, inline...)
-	}
+	// The grounding is not the whole pool: some documents were too large to include, and some files have
+	// not been read yet or could not be read. Rather than let the model answer as if it had seen everything
+	// (a silent, dishonest gap), tell it plainly what it did NOT receive (EHRLICH BLEIBEN).
+	inline = withGroundingNote(inline, groundingNote(gaps))
+	format := askFormat(body.OutputFormat)
 
-	res, err := s.ai.Run(r.Context(), u.Username, aigentic.Req{
-		Prompt:       prompt,
-		OutputFormat: askFormat(body.OutputFormat),
-		Inline:       inline,
-	})
+	res, err := s.ai.Run(r.Context(), u.Username, aigentic.Req{Prompt: prompt, OutputFormat: format, Inline: inline})
+	if errors.Is(err, aigentic.ErrNoVisionEngine) {
+		// The grounding carried room images but no engine reachable here can SEE images (only a local
+		// text-only model is available). Rather than fail the whole answer, retry WITHOUT the images: the
+		// text grounding still stands, and a note tells the model the pictures could not be shown, so the
+		// assistant answers from text and names what it could not see (kein stummes Ausbleiben) — instead of
+		// a room with a text-only engine losing its assistant entirely the moment it holds one image.
+		textOnly := withGroundingNote(dropImageParts(inline), visionUnavailableNote)
+		res, err = s.ai.Run(r.Context(), u.Username, aigentic.Req{Prompt: prompt, OutputFormat: format, Inline: textOnly})
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, aigentic.ErrDisabled):
@@ -83,14 +83,43 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	writeJSON(w, http.StatusOK, map[string]any{"output": res.Output, "model": res.Model, "engine": res.Engine})
 }
 
+// visionUnavailableNote is prepended when an image-bearing turn is retried without its images because no
+// reachable engine can see them, so the assistant answers from text and is honest that it did not see the
+// room's pictures rather than inventing what is in them.
+const visionUnavailableNote = "The room includes pictures (photographs, scans, nameplates) that could NOT be shown to the available AI engine, which cannot see images. Answer from the text below and say plainly that you could not see the room's images."
+
+// withGroundingNote prepends a text/markdown note part to the grounding when note is non-empty, so a
+// disclosure (an incomplete grounding, or images that could not be shown) rides ahead of the content it
+// qualifies. An empty note leaves the grounding unchanged.
+func withGroundingNote(inline []aigentic.InlineFile, note string) []aigentic.InlineFile {
+	if note == "" {
+		return inline
+	}
+	return append([]aigentic.InlineFile{{Path: "grounding-note", MediaType: "text/markdown", Content: note}}, inline...)
+}
+
+// dropImageParts returns the grounding without its image parts, for the text-only retry when no engine
+// can see images. The text (each file's read text, and any disclosure note) is kept intact.
+func dropImageParts(inline []aigentic.InlineFile) []aigentic.InlineFile {
+	out := inline[:0:0]
+	for _, f := range inline {
+		if strings.HasPrefix(f.MediaType, "image/") {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
 // groundingGaps is what the assembled grounding left out, each list kept separate so the note to the
 // model can name the DIFFERENT reasons a document is missing (too large / not read yet / could not be
 // read) rather than blur them into one (Kein Befund ohne Bedeutung).
 type groundingGaps struct {
-	omitted []string // too large to fit aigentic's per-request budget
-	notRead []string // a file whose text has not been read yet (read still pending)
-	unread  []string // a file whose text read failed (a retry may fix it)
-	partial []string // a large read where only the sections relevant to the question were included
+	omitted       []string // too large to fit aigentic's per-request budget
+	notRead       []string // a file whose text has not been read yet (read still pending)
+	unread        []string // a file whose text read failed (a retry may fix it)
+	partial       []string // a large read where only the sections relevant to the question were included
+	omittedImages []string // a read-out image the budget could not fit alongside the text
 }
 
 // roomGrounding turns the pool into aigentic inline parts. The key move of this feature: an uploaded
@@ -156,6 +185,23 @@ func (s *Server) roomGrounding(prompt string) (inline []aigentic.InlineFile, gap
 				} else {
 					gaps.omitted = append(gaps.omitted, groundingPath(d.Title))
 				}
+				// The images READ OUT of this file at upload — kept compressed beside its text — are grounded
+				// as their OWN parts (image/jpeg), so the assistant SEES the pictures (a nameplate, a wiring
+				// photo), not only the text transcribed from them. They count against the SAME budget as text;
+				// an image that no longer fits is NAMED, never silently dropped (Kein stummes Ausbleiben). Any
+				// image part makes the whole turn vision-only on aigentic's side, which the ask handler honours.
+				if pics, ok := s.docs.ExtractImages(d.ID); ok {
+					for _, im := range pics {
+						b64 := base64.StdEncoding.EncodeToString(im.Data)
+						label := imageGroundingLabel(d.Title, im.Page)
+						if !fits(len(b64)) {
+							gaps.omittedImages = append(gaps.omittedImages, label)
+							continue
+						}
+						total += int64(len(b64))
+						out = append(out, aigentic.InlineFile{Path: label, Content: b64, MediaType: "image/jpeg"})
+					}
+				}
 			case "pending", "reading":
 				gaps.notRead = append(gaps.notRead, groundingPath(d.Title))
 			case "failed":
@@ -191,7 +237,7 @@ func (s *Server) roomGrounding(prompt string) (inline []aigentic.InlineFile, gap
 // groundingNote composes the honest disclosure prepended to a turn when the grounding is incomplete,
 // naming each kind of gap with its own reason. Returns "" when the grounding is complete.
 func groundingNote(g groundingGaps) string {
-	if len(g.omitted) == 0 && len(g.notRead) == 0 && len(g.unread) == 0 && len(g.partial) == 0 {
+	if len(g.omitted) == 0 && len(g.notRead) == 0 && len(g.unread) == 0 && len(g.partial) == 0 && len(g.omittedImages) == 0 {
 		return ""
 	}
 	var b strings.Builder
@@ -199,6 +245,10 @@ func groundingNote(g groundingGaps) string {
 	if len(g.omitted) > 0 {
 		b.WriteString("These documents were too large to include in full and were NOT provided to you: " +
 			strings.Join(g.omitted, ", ") + ". ")
+	}
+	if len(g.omittedImages) > 0 {
+		b.WriteString("These document images were too large to include alongside the text and were NOT provided to you: " +
+			strings.Join(g.omittedImages, ", ") + ". ")
 	}
 	if len(g.partial) > 0 {
 		b.WriteString("These documents are large, so only the parts most relevant to the question were included — other parts were left out: " +
@@ -323,6 +373,17 @@ func groundingPath(title string) string {
 		return t
 	}
 	return "document"
+}
+
+// imageGroundingLabel is the provenance path for one read-out image part, naming the document and the
+// page the picture came from ("Room manual (image on page 6)"), so the model — and the honesty note that
+// lists an omitted one — can point at exactly which picture.
+func imageGroundingLabel(title string, page int) string {
+	base := groundingPath(title)
+	if page > 0 {
+		return base + " (image on page " + strconv.Itoa(page) + ")"
+	}
+	return base + " (image)"
 }
 
 // askFormat clamps the requested answer shape to what aigentic accepts, defaulting to markdown.

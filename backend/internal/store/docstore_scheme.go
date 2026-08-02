@@ -38,8 +38,9 @@ import (
 const (
 	docPrefix     = "documents"
 	blobPrefix    = "blobs"
-	extractPrefix = "extracts"     // the derived extract text of a file document, one node per document
-	jobPrefix     = "extract-jobs" // an in-progress chunked-read job, so a large read resumes after a crash
+	extractPrefix = "extracts"       // the derived extract text of a file document, one node per document
+	imagePrefix   = "extract-images" // the compressed images read out of a file document (JSON), one node per document
+	jobPrefix     = "extract-jobs"   // an in-progress chunked-read job, so a large read resumes after a crash
 )
 
 // NewDocStore returns the scheme-backed document backend (selected because this file's `scheme`
@@ -279,12 +280,14 @@ func (s *SchemeDocs) SetExtract(id string, ex Extract) error {
 		d.ExtractTextLayer = false
 		d.ExtractSectionsDone, d.ExtractSectionsTotal = 0, 0
 		d.ExtractSectionLabel = ""
+		d.ExtractSectionPhase = ""
 	case "reading":
 		d.ExtractState = "reading"
 		d.ExtractTextLayer = ex.TextLayer
 		d.ExtractSectionsDone = ex.SectionsDone
 		d.ExtractSectionsTotal = ex.SectionsTotal
 		d.ExtractSectionLabel = ex.SectionLabel
+		d.ExtractSectionPhase = ex.SectionPhase
 	case "ready":
 		d.ExtractState = "ready"
 		d.ExtractSource = ex.Source
@@ -296,11 +299,13 @@ func (s *SchemeDocs) SetExtract(id string, ex Extract) error {
 		d.ExtractTextLayer = ex.TextLayer
 		d.ExtractSectionsDone, d.ExtractSectionsTotal = ex.SectionsDone, ex.SectionsTotal
 		d.ExtractSectionLabel = ex.SectionLabel
+		d.ExtractSectionPhase = ex.SectionPhase
 	case "failed":
 		d.ExtractState = "failed"
 		d.ExtractError = ex.Error
 		d.ExtractedAt = ex.At
 		d.ExtractTextLayer = ex.TextLayer
+		d.ExtractSectionPhase = ""
 		if ex.SectionsTotal > 0 {
 			d.ExtractSectionsDone, d.ExtractSectionsTotal = ex.SectionsDone, ex.SectionsTotal
 			d.ExtractSectionLabel = ex.SectionLabel
@@ -348,6 +353,44 @@ func (s *SchemeDocs) ExtractJob(id string) ([]byte, bool) {
 	return b, true
 }
 
+// SetExtractImages stores the compressed images read out of a file document as a described node at
+// extract-images/<id> (their JSON encoding), beside the extract text as part of the SAME entity — never
+// a parallel store. An empty slice deletes the node (a fresh read starts with none). scheme's FFI takes
+// a whole buffer; the images are compact (downscaled JPEGs), so this is a modest, bounded write.
+func (s *SchemeDocs) SetExtractImages(id string, imgs []ExtractImage) error {
+	if id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(imgs) == 0 {
+		return s.deleteLocked(imagePrefix + "/" + id)
+	}
+	b, err := json.Marshal(imgs)
+	if err != nil {
+		return err
+	}
+	return s.putLocked(imagePrefix+"/"+id, "extract-images", b)
+}
+
+// ExtractImages returns the compressed images read out of a file document, and whether any are present.
+func (s *SchemeDocs) ExtractImages(id string) ([]ExtractImage, bool) {
+	if id == "" {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok, err := s.getBytes(imagePrefix + "/" + id)
+	if err != nil || !ok {
+		return nil, false
+	}
+	var imgs []ExtractImage
+	if json.Unmarshal(b, &imgs) != nil || len(imgs) == 0 {
+		return nil, false
+	}
+	return imgs, true
+}
+
 // ExtractText returns a file document's derived text (its extracts/<id> node), and whether present.
 func (s *SchemeDocs) ExtractText(id string) (string, bool) {
 	if id == "" {
@@ -375,6 +418,9 @@ func (s *SchemeDocs) Delete(id string) error {
 		return err
 	}
 	if err := s.deleteLocked(extractPrefix + "/" + id); err != nil {
+		return err
+	}
+	if err := s.deleteLocked(imagePrefix + "/" + id); err != nil {
 		return err
 	}
 	return s.deleteLocked(jobPrefix + "/" + id)

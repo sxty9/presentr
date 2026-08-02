@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -181,13 +182,52 @@ func (s *Server) readSections(id, subject, title string, plan extract.Plan, ai e
 	}
 
 	// Publish the starting state: usable text already (ready) when a text layer exists, else plain reading.
-	s.publishProgress(id, hasText, localText, plan.Source, results, total, sectionLabel(sections, resumeFrom))
+	s.publishProgress(id, hasText, localText, plan.Source, results, total, sectionLabel(sections, resumeFrom), "")
+
+	// The compressed images accumulate here, keyed by section index, and are persisted beside the extract
+	// so the room assistant can later be shown the pictures themselves (roomGrounding). A fresh read starts
+	// with none (dropping any from a prior read); a resumed read reloads what was already compressed before
+	// the interruption, so a crash never loses an already-compressed picture nor re-keys it.
+	images := map[int]store.ExtractImage{}
+	if resumeFrom > 0 {
+		if prior, ok := s.docs.ExtractImages(id); ok {
+			for _, im := range prior {
+				images[im.Index] = im
+			}
+		}
+	} else {
+		_ = s.docs.SetExtractImages(id, nil)
+	}
 
 	for i := resumeFrom; i < total; i++ {
+		sec := sections[i]
+
+		// Image-compression step — its OWN visible sub-step, run BEFORE and separate from the AI read of the
+		// same image (the task's per-image compression step). The compact JPEG it produces is BOTH sent to
+		// the vision AI and kept beside the extract, so the assistant can later be shown the picture itself.
+		if sec.NeedsCompression() {
+			s.publishProgress(id, hasText, localText, plan.Source, results, total, sec.Label, "compressing")
+			compressed, ok := sec.Compress(s.sectionBudget())
+			if !ok {
+				// A codec this reader cannot decode: name it as a gap (never sent to the AI) and carry on, so
+				// the other images and the text track are unaffected (Kein stummes Ausbleiben).
+				results = append(results, extract.SectionResult{Label: sec.Label, Track: sec.Track, Page: sec.Page, Note: extract.UndecodableImageNote})
+				_ = s.docs.SetExtractJob(id, encodeJob(total, 0, results))
+				s.publishProgress(id, hasText, localText, plan.Source, results, total, sec.Label, "reading")
+				continue
+			}
+			sec = compressed
+			images[i] = store.ExtractImage{Index: i, Page: sec.Page, Data: sec.Data}
+			_ = s.docs.SetExtractImages(id, sortedImages(images))
+		}
+
+		// AI-read step of this section (an image just compressed, a page range, or a whole document).
+		s.publishProgress(id, hasText, localText, plan.Source, results, total, sec.Label, "reading")
+
 		var r extract.SectionResult
 		for {
 			ctx, cancel := context.WithTimeout(context.Background(), sectionTimeout(attempts))
-			r = extract.ReadSection(ctx, ai, subject, title, sections[i])
+			r = extract.ReadSection(ctx, ai, subject, title, sec)
 			cancel()
 			if r.Err == nil || r.TooBig || r.Note != "" || !isRetryableAbort(r.Err) {
 				break // read, a per-section verdict (too big / note) — not a retry case
@@ -217,15 +257,17 @@ func (s *Server) readSections(id, subject, title string, plan extract.Plan, ai e
 		results = append(results, r)
 		attempts = 0
 		_ = s.docs.SetExtractJob(id, encodeJob(total, attempts, results))
-		s.publishProgress(id, hasText, localText, plan.Source, results, total, sections[i].Label)
+		s.publishProgress(id, hasText, localText, plan.Source, results, total, sections[i].Label, "reading")
 	}
 
 	// Final assembly of both tracks.
 	res, anyText := extract.Combine(localText, plan.Source, results)
 	if !anyText {
 		// Nothing legible from any track (a scan where every page failed, or a lone oversized image). Fail
-		// with a named reason and clear the resume job so a retry re-reads rather than replaying the gap.
+		// with a named reason and clear the resume job so a retry re-reads rather than replaying the gap. A
+		// failed read grounds nothing, so drop any images compressed along the way rather than keep them idle.
 		_ = s.docs.SetExtractJob(id, nil)
+		_ = s.docs.SetExtractImages(id, nil)
 		_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: noTextReason(results), SectionsDone: total, SectionsTotal: total, At: time.Now().Unix()})
 		return
 	}
@@ -243,17 +285,28 @@ func (s *Server) readSections(id, subject, title string, plan extract.Plan, ai e
 // image so a recognized nameplate is added as soon as it is read; SectionsDone < SectionsTotal marks the
 // images still in flight. Without a text track (a scan) there is no usable text yet, so it is plain
 // "reading" progress. label names the most recent image by page, for "image on page 6 — 3 of 6".
-func (s *Server) publishProgress(id string, hasText bool, localText, source string, results []extract.SectionResult, total int, label string) {
+func (s *Server) publishProgress(id string, hasText bool, localText, source string, results []extract.SectionResult, total int, label, phase string) {
 	done := len(results)
 	if hasText {
 		res, _ := extract.Combine(localText, source, results)
 		_ = s.docs.SetExtract(id, store.Extract{
 			State: "ready", Text: res.Text, Source: res.Source, Model: res.Model, Engine: res.Engine,
-			TextLayer: true, SectionsDone: done, SectionsTotal: total, SectionLabel: label, At: time.Now().Unix(),
+			TextLayer: true, SectionsDone: done, SectionsTotal: total, SectionLabel: label, SectionPhase: phase, At: time.Now().Unix(),
 		})
 		return
 	}
-	_ = s.docs.SetExtract(id, store.Extract{State: "reading", SectionsDone: done, SectionsTotal: total, SectionLabel: label})
+	_ = s.docs.SetExtract(id, store.Extract{State: "reading", SectionsDone: done, SectionsTotal: total, SectionLabel: label, SectionPhase: phase})
+}
+
+// sortedImages flattens the accumulated compressed images into section-index order for persistence, so a
+// resumed read re-keys them and the grounding sees them in reading order.
+func sortedImages(m map[int]store.ExtractImage) []store.ExtractImage {
+	out := make([]store.ExtractImage, 0, len(m))
+	for _, im := range m {
+		out = append(out, im)
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].Index < out[b].Index })
+	return out
 }
 
 // publishInterruption records an engine outage mid-image-read. With a text track the state stays "ready"
@@ -490,6 +543,7 @@ func (s *Server) getExtract(w http.ResponseWriter, r *http.Request, _ *auth.User
 		"sectionsDone":  d.ExtractSectionsDone,
 		"sectionsTotal": d.ExtractSectionsTotal,
 		"sectionLabel":  d.ExtractSectionLabel,
+		"sectionPhase":  d.ExtractSectionPhase,
 		"text":          text,
 	})
 }

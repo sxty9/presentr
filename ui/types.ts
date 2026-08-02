@@ -36,10 +36,14 @@ export interface Document {
   //   - The IMAGE track: extractSectionsDone/Total count the embedded images read out of how many, and
   //     extractSectionLabel names the most recent one by page ("image on page 6"). A text-layer file whose
   //     images are still being read is already state "ready" (its text is usable) with done < total.
+  //   - extractSectionPhase names the current sub-step of the image in progress: "compressing" (the
+  //     picture is being downscaled) or "reading" (its compact form is at the vision AI), so the wait
+  //     shows "Compressing image 3 of 11" then "Reading image on page 6", not one opaque counter.
   extractTextLayer?: boolean;
   extractSectionsDone?: number;
   extractSectionsTotal?: number;
   extractSectionLabel?: string;
+  extractSectionPhase?: 'compressing' | 'reading' | '';
 }
 
 // GET docs/{id}/extract — a file's read state plus the text that was read, so the UI can show exactly
@@ -55,6 +59,7 @@ export interface ExtractResponse {
   sectionsDone: number;
   sectionsTotal: number;
   sectionLabel: string;
+  sectionPhase: string;
   text: string;
 }
 

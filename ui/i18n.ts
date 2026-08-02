@@ -82,6 +82,7 @@ registerMessages({
     'presentr.trackImagesHeading': 'Images',
     'presentr.trackImagesProgress': '{done} of {total} images read',
     'presentr.trackImagesCurrent': 'Reading {label} — {done} of {total}',
+    'presentr.trackImagesCompressing': 'Compressing image {n} of {total}',
     'presentr.trackImagesReady': '{total} images read',
     'presentr.trackImageBadge': 'Images {done}/{total}',
     'presentr.extractImagesIncomplete': 'The text is ready. Some images have not been read yet — read the remaining images again.',

@@ -31,6 +31,13 @@ var ErrDisabled = errors.New("aigentic: client not configured")
 // local model reachable and no Claude credential linked for the subject. Actionable by an admin/user.
 var ErrUnavailable = errors.New("aigentic: no AI engine is available")
 
+// ErrNoVisionEngine means aigentic refused an image-bearing turn (422) because no reachable engine can
+// SEE images — the request carried images but only a text-only local model is available. aigentic
+// enforces this itself (an image never reaches a blind model that would fabricate a description); this
+// client surfaces it as a distinct error so the caller can retry the turn without its images rather than
+// fail. presentr only ever runs a single, un-nested turn, so a 422 from it is always this refusal.
+var ErrNoVisionEngine = errors.New("aigentic: no vision-capable engine for an image request")
+
 // InlineFile is one grounding part handed to aigentic without any server fs access: text carries its
 // content directly; an image or PDF carries base64 bytes plus its media type (mirrors
 // aigentic.InlineFile — the contract, never imported).
@@ -198,6 +205,11 @@ func (c *Client) dispatch(ctx context.Context, subject, kind string, data wireDa
 
 	if resp.StatusCode == http.StatusServiceUnavailable {
 		return Res{}, fmt.Errorf("%w: %s", ErrUnavailable, detailOf(resp.Body))
+	}
+	if resp.StatusCode == http.StatusUnprocessableEntity {
+		// aigentic returns 422 for an image request it cannot serve with a vision-capable engine. presentr
+		// runs only single, un-nested turns, so a 422 is always that refusal (never a recursion-depth limit).
+		return Res{}, fmt.Errorf("%w: %s", ErrNoVisionEngine, detailOf(resp.Body))
 	}
 	if resp.StatusCode >= 300 {
 		return Res{}, fmt.Errorf("aigentic: run failed (%d): %s", resp.StatusCode, detailOf(resp.Body))
