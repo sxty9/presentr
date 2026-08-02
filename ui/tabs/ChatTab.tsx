@@ -17,16 +17,14 @@ import {
   useT,
   type ServiceContextProps,
 } from '@holisdk/ui';
-import type { AigenticResult, ChatHistory, ChatMessage, DocsResponse, PrizmEnvelope } from '../types';
+import type { ChatHistory, ChatMessage, DocsResponse } from '../types';
+import { askRoom, roomGrounding } from '../roomAI';
 
 // The room assistant — the heart of presentr. The user asks questions and the assistant answers as
 // an explainer, grounded in the document pool (and, in a following step, the connection diagram).
 // Per the holistic "Ask AI" standard the AI runs in the shared aigentic service (via
 // apiFor('aigentic')); presentr only persists the transcript so a reload returns to the same
 // session. Every assistant answer is labelled with the model that produced it.
-
-// Router kind: let aigentic pick the best available engine (local ollama or Claude).
-const ENGINE = 'choose';
 
 // The assistant's role, sent as prompt guidance (not a user-facing string — it is model input).
 const PREAMBLE =
@@ -76,16 +74,9 @@ export function ChatTab({ api, apiFor, ui }: Pick<ServiceContextProps, 'api' | '
     void api.put('chats', { messages: convo }).catch(() => {});
     try {
       const docs = docsQ.data?.docs ?? [];
-      const inline = docs
-        .filter((d) => d.content && d.content.trim())
-        .map((d) => ({ path: d.title || 'document', content: d.content, mediaType: 'text/markdown' }));
       const transcript = convo.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`).join('\n\n');
       const prompt = `${PREAMBLE}\n\n${docs.length === 0 ? NO_DOCS_NOTE + '\n\n' : ''}${transcript}\n\nAssistant:`;
-      const env = await apiFor('aigentic').post<PrizmEnvelope<AigenticResult>>('run', {
-        header: { kind: ENGINE },
-        data: { prompt, inline, outputFormat: 'markdown' },
-      });
-      const result = env?.data ?? ({} as AigenticResult);
+      const result = await askRoom(apiFor, { prompt, inline: roomGrounding(docs), outputFormat: 'markdown' });
       const answer: ChatMessage = {
         role: 'assistant',
         text: (result.output || '').trim() || t('presentr.chatEmpty'),

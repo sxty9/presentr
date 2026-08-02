@@ -40,6 +40,10 @@ pool), **Connection** (the diagram derived from it), **Chat** (the assistant ove
   active tab lives in `nav.path`, so a browser reload lands on the same tab (Zustandserhalt).
 - `ui/tabs/` — one file per tab (`DocsTab`, `ConnectionTab`, `ChatTab`). Each renders **only**
   `@holisdk/ui`, resolves every string via `useT()`.
+- `ui/roomAI.ts` — the ONE access point to the room's AI. Both the Chat tab and the Connection
+  diagram ground the model in the same source (the document pool) and speak the same aigentic
+  `/run` envelope, so `roomGrounding()` + `askRoom()` live here once instead of being re-derived
+  per tab. The aigentic contract is mirrored in `types.ts`, never imported.
 - `ui/i18n.ts` — the `registerMessages()` catalog (en-US; nightly adds the other locales). Owns
   the localized `service.presentr` sidebar label and all UI strings.
 
