@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"presentr/internal/aigentic"
@@ -27,11 +28,8 @@ const (
 	version = "0.1.0"
 
 	maxDocBody     = 1 << 20 // 1 MiB cap for a text document submission
-	maxChatBody    = 4 << 20 // 4 MiB cap for a full-conversation replace
+	maxChatBody    = 4 << 20 // 4 MiB cap for the whole conversation list of one owner
 	maxDiagramBody = 4 << 20 // 4 MiB cap for a whole-diagram replace
-	maxMessages    = 200     // keep at most the newest N turns of a conversation
-	maxMsgLen      = 100_000 // clamp a single message's text
-	maxLabelLen    = 100     // clamp a model/engine label
 
 	maxNodes   = 200   // clamp the number of devices in a diagram
 	maxEdges   = 600   // clamp the number of connections
@@ -52,14 +50,28 @@ type Server struct {
 	chats   *store.ChatPool
 	diagram *store.DiagramPool
 	ai      *aigentic.Client // the room's AI, reached on the caller's behalf; nil/disabled => /ask 503s
+	// extractSem bounds how many uploaded files are read (text-layer parse or AI recognition) at once,
+	// so a burst of large uploads cannot spawn unbounded background work. Buffered in New.
+	extractSem chan struct{}
+	// extractWG tracks in-flight background reads so they can be drained (a graceful stop, and a
+	// deterministic test that must not race a temp-dir cleanup).
+	extractWG sync.WaitGroup
 }
+
+// maxConcurrentExtractions caps parallel background reads (see extractSem).
+const maxConcurrentExtractions = 4
 
 // New builds a server over the session verifier and the pools (the single access points to the
 // room's knowledge, its connection diagram and the users' conversations with the assistant). ai is
 // the client for the room's AI (aigentic); a nil or unconfigured client leaves /ask reporting the
-// assistant as unavailable, and the UI degrades gracefully.
+// assistant as unavailable, and the UI degrades gracefully. The same client also reads text out of
+// uploaded images and scans (see extract.go); when it is absent, those reads fail with a named,
+// retriable reason rather than blocking the daemon.
 func New(v *auth.Verifier, docs store.DocStore, chats *store.ChatPool, diagram *store.DiagramPool, ai *aigentic.Client) *Server {
-	return &Server{v: v, docs: docs, chats: chats, diagram: diagram, ai: ai}
+	return &Server{
+		v: v, docs: docs, chats: chats, diagram: diagram, ai: ai,
+		extractSem: make(chan struct{}, maxConcurrentExtractions),
+	}
 }
 
 type handler func(w http.ResponseWriter, r *http.Request, u *auth.User)
@@ -80,6 +92,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+base+"docs/{id}", s.guard(rights.GroupUse, false, s.getDoc))
 	// The raw bytes of a file document, for the SDK viewers (image/PDF preview). Read-only.
 	mux.HandleFunc("GET "+base+"docs/{id}/raw", s.guard(rights.GroupUse, false, s.getRaw))
+	// The derived text read out of a file document (the extract), for the UI to show what the assistant
+	// will actually read. Read-only.
+	mux.HandleFunc("GET "+base+"docs/{id}/extract", s.guard(rights.GroupUse, false, s.getExtract))
+	// Re-run the text read of a file document without re-uploading it — for a read that failed
+	// (no AI, a broken file) once the cause is cleared. Right-gated + CSRF (it spends AI budget).
+	mux.HandleFunc("POST "+base+"docs/{id}/extract", s.guard(rights.GroupUse, true, s.reExtract))
 	mux.HandleFunc("DELETE "+base+"docs/{id}", s.guard(rights.GroupUse, true, s.deleteDoc))
 
 	// The room assistant's conversation (workflow stage 3), persisted per user so a reload lands
@@ -222,59 +240,39 @@ func (s *Server) deleteDoc(w http.ResponseWriter, r *http.Request, _ *auth.User)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// getChats returns the caller's conversation with the room assistant. Owner-scoped: a user only
-// ever reads their own transcript.
+// getChats returns the caller's conversations with the room assistant, verbatim — one opaque JSON
+// blob (a list of conversations) whose shape the UI's ChatAdapter owns. Owner-scoped: a user only
+// ever reads their own conversations. Always valid JSON ("[]" when there are none).
 func (s *Server) getChats(w http.ResponseWriter, _ *http.Request, u *auth.User) {
-	writeJSON(w, http.StatusOK, map[string]any{"messages": s.chats.History(u.Username)})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(s.chats.Blob(u.Username))
 }
 
-// putChats replaces the caller's conversation. The full transcript is submitted by the UI after
-// each turn (the assistant is stateless per call). Every record is authored and clamped HERE —
-// outside the passive pool — before being handed over: roles are whitelisted, text and labels are
-// bounded, creation time is stamped when missing, and the history is capped to the newest turns.
+// putChats replaces the caller's whole conversation list. The room assistant is the ONE shared
+// chat building block (@holisdk/ui <Chat>), which owns the conversation shape and re-sends the
+// full list after each change — so the payload is opaque to the backend, exactly as aigentic's is.
+// Policy still lives HERE, outside the passive pool: this layer bounds the size and validates the
+// blob is a JSON array before handing it over; the pool only stores the bytes. An empty body clears
+// the caller's conversations.
 func (s *Server) putChats(w http.ResponseWriter, r *http.Request, u *auth.User) {
-	var body struct {
-		Messages []struct {
-			Role    string `json:"role"`
-			Text    string `json:"text"`
-			Model   string `json:"model"`
-			Engine  string `json:"engine"`
-			Created int64  `json:"created"`
-		} `json:"messages"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxChatBody)).Decode(&body); err != nil && err != io.EOF {
-		writeErr(w, http.StatusBadRequest, "Invalid request body")
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxChatBody))
+	if err != nil {
+		writeErr(w, http.StatusRequestEntityTooLarge, "The conversation history is too large")
 		return
 	}
-	msgs := body.Messages
-	if len(msgs) > maxMessages {
-		msgs = msgs[len(msgs)-maxMessages:] // keep the newest turns
+	if len(body) > 0 {
+		var probe []json.RawMessage
+		if err := json.Unmarshal(body, &probe); err != nil {
+			writeErr(w, http.StatusBadRequest, "Invalid conversation data")
+			return
+		}
 	}
-	out := make([]store.Message, 0, len(msgs))
-	for _, m := range msgs {
-		if m.Role != "user" && m.Role != "assistant" {
-			continue
-		}
-		text := strings.TrimSpace(m.Text)
-		if text == "" {
-			continue
-		}
-		if len(text) > maxMsgLen {
-			text = text[:maxMsgLen]
-		}
-		created := m.Created
-		if created == 0 {
-			created = time.Now().Unix()
-		}
-		out = append(out, store.Message{
-			Role: m.Role, Text: text, Model: clip(m.Model, maxLabelLen), Engine: clip(m.Engine, maxLabelLen), Created: created,
-		})
-	}
-	if err := s.chats.Replace(u.Username, out); err != nil {
+	if err := s.chats.Save(u.Username, body); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not save the conversation")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "messages": out})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // diagramView is the shape the UI reads: the current graph plus which state it is in and the
