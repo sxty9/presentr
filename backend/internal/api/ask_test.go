@@ -207,8 +207,8 @@ func TestRoomGroundingIncludesReadImages(t *testing.T) {
 	if image == nil {
 		t.Fatalf("the read-out image must be grounded as its own image/jpeg part")
 	}
-	if image.Path != "manual.pdf (image on page 2)" {
-		t.Fatalf("the image part must name its document and page, got %q", image.Path)
+	if image.Path != "manual.pdf (image on page 2).jpg" {
+		t.Fatalf("the image part must name its document and page and end in a real image extension, got %q", image.Path)
 	}
 	if image.Content != base64.StdEncoding.EncodeToString(jpg) {
 		t.Fatalf("the image part must be base64 of the compressed bytes")
@@ -235,10 +235,10 @@ func TestRoomGroundingNamesOmittedImage(t *testing.T) {
 			t.Fatalf("an over-budget image must not be sent")
 		}
 	}
-	if len(gaps.omittedImages) != 1 || gaps.omittedImages[0] != "big.pdf (image on page 1)" {
+	if len(gaps.omittedImages) != 1 || gaps.omittedImages[0] != "big.pdf (image on page 1).jpg" {
 		t.Fatalf("an over-budget image must be named as omitted, got %+v", gaps.omittedImages)
 	}
-	if note := groundingNote(gaps); !strings.Contains(note, "big.pdf (image on page 1)") {
+	if note := groundingNote(gaps); !strings.Contains(note, "big.pdf (image on page 1).jpg") {
 		t.Fatalf("the note must disclose the omitted image: %q", note)
 	}
 }

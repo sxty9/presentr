@@ -246,6 +246,7 @@ func ReadSection(ctx context.Context, ai AIExtractor, subject, filename string, 
 	if sec.Label != "" && sec.Label != "whole document" && sec.Label != "image" {
 		name = filename + " (" + sec.Label + ")"
 	}
+	name = NameWithExt(name, sec.Mime)
 	text, engine, model, err := ai.Extract(ctx, subject, name, sec.Mime, sec.Data)
 	if err != nil {
 		base.Err = err
@@ -253,6 +254,41 @@ func ReadSection(ctx context.Context, ai AIExtractor, subject, filename string, 
 	}
 	base.Text, base.Engine, base.Model = text, engine, model
 	return base
+}
+
+// ExtForMime maps a media type to the file extension it implies, or "" when there is no well-known one.
+// It is the single place presentr names an extension for a media type, reused by the api layer's image
+// grounding so the mapping lives once (Keine Redundanz).
+func ExtForMime(mime string) string {
+	switch mime {
+	case "image/jpeg":
+		return ".jpg"
+	case "image/png":
+		return ".png"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "application/pdf":
+		return ".pdf"
+	default:
+		return ""
+	}
+}
+
+// NameWithExt ensures a section's grounding name ends with the file extension its media type implies,
+// appending one when it is missing (case-insensitively). aigentic's claude-cli leaf writes each inline
+// attachment to disk under this name, and its Read tool recognises the bytes by extension, NOT by
+// sniffing content: an image or PDF handed over under a name ending in a section label — e.g. "… (image
+// 1 of 3 on page 4)" — is treated as opaque binary, so the CLI wastes a whole (often timing-out) attempt
+// puzzling over how to open it instead of reading the picture. A name that already carries the right
+// extension is left untouched.
+func NameWithExt(name, mime string) string {
+	ext := ExtForMime(mime)
+	if ext == "" || strings.HasSuffix(strings.ToLower(name), ext) {
+		return name
+	}
+	return name + ext
 }
 
 // AssembleText joins the section results into one extract text, naming any section that could not be
