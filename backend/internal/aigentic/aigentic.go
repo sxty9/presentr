@@ -41,13 +41,10 @@ type InlineFile struct {
 }
 
 // Req is the subset of aigentic's request presentr sets: the prompt, the requested answer shape, an
-// optional engine (aigentic routing kind) and model override, and the room grounding as inline
-// parts. Engine mirrors aigentic's engine kinds (choose/ollama/claude-cli/claude-api); empty means
-// "choose" — aigentic picks the best engine (the Ask-AI standard).
+// optional model override, and the room grounding as inline parts.
 type Req struct {
 	Prompt       string
 	OutputFormat string // "text" | "markdown" | "json"
-	Engine       string
 	Model        string
 	Inline       []InlineFile
 }
@@ -101,18 +98,12 @@ type wireReq struct {
 	Data json.RawMessage `json:"data"`
 }
 
-// Run executes one turn on behalf of subject and returns the engine's answer. The caller's chosen
-// engine is the routing kind; empty falls back to aigentic's `choose` router (the "Ask AI" standard:
-// aigentic picks the best engine it can offer). aigentic resolves the subject and dispatches to that
-// kind, so an unknown kind fails there, not silently here. A missing engine (aigentic 503) maps to
-// ErrUnavailable; any other non-2xx to a generic error carrying aigentic's detail; a transport error
-// (including the context deadline) is returned as-is.
+// Run executes one turn on behalf of subject and returns the engine's answer. It uses aigentic's
+// `choose` router (the "Ask AI" standard: aigentic picks the best engine it can offer). A missing
+// engine (aigentic 503) maps to ErrUnavailable; any other non-2xx to a generic error carrying
+// aigentic's detail; a transport error (including the context deadline) is returned as-is.
 func (c *Client) Run(ctx context.Context, subject string, req Req) (Res, error) {
-	kind := strings.TrimSpace(req.Engine)
-	if kind == "" {
-		kind = "choose"
-	}
-	return c.dispatch(ctx, subject, kind, wireData{
+	return c.dispatch(ctx, subject, "choose", wireData{
 		Prompt: req.Prompt, OutputFormat: req.OutputFormat, Model: req.Model, Inline: req.Inline,
 	})
 }

@@ -96,11 +96,18 @@ registerMessages({
     'presentr.diagramSaveFailed': 'Could not save the diagram',
     'presentr.diagramRestoreFailed': 'Could not restore the diagram',
 
-    // Chat tab (the assistant — the shared @holistic/ui <Chat>, routed through aigentic). The chat
-    // itself brings its own strings (chat.*, from the shared catalog); presentr adds only its OWN
-    // parts: the composer placeholder and the room-document grounding indicator.
+    // Chat tab (the assistant — routed through aigentic)
+    'presentr.chatHeading': 'Room assistant',
+    'presentr.chatSubtitle': 'Grounded in the document pool. Answers are labelled with the model that produced them.',
     'presentr.chatPlaceholder': 'Ask about the room — e.g. “How do I connect my laptop to the projector?”',
-    'presentr.chatGrounded': 'Grounded in {count} room documents',
-    'presentr.chatNoDocs': 'No room documents yet',
+    'presentr.chatSend': 'Send',
+    'presentr.chatThinking': 'Thinking…',
+    'presentr.chatEmpty': '(no answer)',
+    'presentr.chatFailed': 'The assistant could not answer',
+    'presentr.chatEmptyTitle': 'Ask the room assistant',
+    'presentr.chatEmptyBody': 'Ask anything about the room. Answers are grounded in the documents you added in the Docs tab.',
+    'presentr.chatClear': 'Clear',
+    'presentr.chatClearTitle': 'Clear conversation',
+    'presentr.chatClearConfirm': 'Delete this conversation? This cannot be undone.',
   },
 });

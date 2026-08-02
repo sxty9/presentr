@@ -39,11 +39,6 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	var body struct {
 		Prompt       string `json:"prompt"`
 		OutputFormat string `json:"outputFormat"`
-		// Engine (aigentic routing kind) and Model carry the user's machine + model choice from the
-		// shared <Chat>. Empty engine → "choose" (the Ask-AI default); the Connection diagram leaves
-		// both empty and always runs on Auto.
-		Engine string `json:"engine"`
-		Model  string `json:"model"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxAskBody)).Decode(&body); err != nil && err != io.EOF {
 		writeErr(w, http.StatusBadRequest, "Invalid request body")
@@ -71,8 +66,6 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	res, err := s.ai.Run(r.Context(), u.Username, aigentic.Req{
 		Prompt:       prompt,
 		OutputFormat: askFormat(body.OutputFormat),
-		Engine:       strings.TrimSpace(body.Engine),
-		Model:        strings.TrimSpace(body.Model),
 		Inline:       inline,
 	})
 	if err != nil {
