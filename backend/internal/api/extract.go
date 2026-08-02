@@ -28,10 +28,32 @@ import (
 	"presentr/internal/store"
 )
 
-// extractTimeout bounds ONE section read (a whole small file, or one page range of a split PDF). AI
-// recognition of a scanned page is slow, so this is generous; it exists only so a stuck upstream call
-// cannot pin a worker forever. A large PDF read is many sections, each bounded by this.
+// extractTimeout bounds the FIRST read of ONE section (a whole small file, or one page range of a split
+// PDF). AI recognition of a scanned page is slow, so this is generous; it exists only so a stuck upstream
+// call cannot pin a worker forever. A large PDF read is many sections, each bounded by this on its first
+// try and by sectionTimeout on any retry.
 const extractTimeout = 5 * time.Minute
+
+// maxSectionAttempts bounds how many times ONE section is read before presentr stops waiting on it. The
+// first attempt uses extractTimeout; each retry after a TIMEOUT stretches the deadline (sectionTimeout).
+// A section that keeps exceeding even the stretched deadline is structurally too slow — a page so dense
+// the engine cannot finish it in the window — not merely unlucky, so retrying it forever would reproduce
+// the same timeout endlessly. After this many timed-out attempts the section is named as unread and the
+// read moves on, so the rest of the file still reads. Only a TIMEOUT counts against this budget; a genuine
+// engine outage is a plain interruption that a later resume retries unchanged.
+const maxSectionAttempts = 2
+
+// sectionTimeout is the deadline for the (attempts+1)-th read of one section: extractTimeout on the first
+// try and stretched on each retry after a timeout, capped so a single slow section cannot pin a worker
+// without bound. A slow-but-finite section gets a real, longer second chance before it is abandoned; a
+// structurally too-slow one is still bounded by maxSectionAttempts.
+func sectionTimeout(attempts int) time.Duration {
+	d := extractTimeout * time.Duration(attempts+1)
+	if limit := extractTimeout * time.Duration(maxSectionAttempts); d > limit {
+		d = limit
+	}
+	return d
+}
 
 // fallbackRequestLimit is the conservative per-request byte ceiling presentr assumes when it could not
 // learn aigentic's own (RefreshRequestLimit) — aigentic's documented request cap. It is a FLOOR used
@@ -116,17 +138,26 @@ func (s *Server) runExtraction(id string) {
 // state honest throughout. For a single section it behaves like the old single-pass read. For many
 // (a split PDF) it shows progress ("section 7 of 40"), persists a resume job after each section so an
 // interruption continues rather than restarts, and names any section that could not be read.
+//
+// A section that TIMES OUT is retried with a stretched deadline (sectionTimeout) up to maxSectionAttempts;
+// a structurally too-slow section that still overruns is then named as unread and SKIPPED, so a single
+// poison section can no longer reproduce the same timeout forever nor block the rest of the file. A
+// genuine engine outage (not a timeout) stays a plain, resumable interruption — it is not the section's
+// fault, so it does not spend the section's attempts.
 func (s *Server) readSections(id, subject, title string, sections []extract.Section, ai extract.AIExtractor) {
 	total := len(sections)
 	multi := total > 1
 
 	// Resume: if a prior run of THIS same plan (same section count) left completed sections behind, reuse
-	// them and continue — never re-read a section already read (the task's "nicht von vorn").
+	// them and pick up the attempt count of the section it was on — never re-read a section already read
+	// (the task's "nicht von vorn"), and never reset a stretched deadline back to the short one.
 	var results []extract.SectionResult
+	attempts := 0
 	if multi {
 		if raw, ok := s.docs.ExtractJob(id); ok {
-			if done, ok := decodeJob(raw, total); ok {
+			if done, at, ok := decodeJob(raw, total); ok {
 				results = done
+				attempts = at
 			}
 		}
 	}
@@ -140,24 +171,55 @@ func (s *Server) readSections(id, subject, title string, sections []extract.Sect
 	}
 
 	for i := resumeFrom; i < total; i++ {
-		ctx, cancel := context.WithTimeout(context.Background(), extractTimeout)
-		r := extract.ReadSection(ctx, ai, subject, title, sections[i])
-		cancel()
-		// A dropped engine (or a cancelled/timed-out call) is an INTERRUPTION, not a per-section verdict:
-		// stop, keep what is read, and leave a named, resumable failed state. A retry (reExtract) or a
-		// restart (ResumePending, for the "reading" state) continues from exactly here.
-		if r.Err != nil && !r.TooBig && isRetryableAbort(r.Err) {
-			if multi {
-				_ = s.docs.SetExtractJob(id, encodeJob(total, results))
-				_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: interruptedReason(i, total, r.Err), SectionsDone: i, SectionsTotal: total, At: time.Now().Unix()})
-			} else {
-				_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: extractFailureReason(r.Err), At: time.Now().Unix()})
+		// Read section i, stretching the deadline on each timeout up to maxSectionAttempts. attempts carries
+		// in from a resume so an already-stretched section is not restarted at the short deadline.
+		var r extract.SectionResult
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), sectionTimeout(attempts))
+			r = extract.ReadSection(ctx, ai, subject, title, sections[i])
+			cancel()
+			if r.Err == nil || r.TooBig || !isRetryableAbort(r.Err) {
+				break // read, or a per-section verdict (too big) — not a retry case
 			}
-			return
+			if !errors.Is(r.Err, context.DeadlineExceeded) {
+				// A dropped engine (or a cancelled call) is an INTERRUPTION, not this section being slow: stop,
+				// keep what is read, and leave a named, resumable failed state. A retry (reExtract) or a restart
+				// (ResumePending, for the "reading" state) continues from exactly here. attempts is preserved so
+				// a stretched deadline survives the interruption.
+				if multi {
+					_ = s.docs.SetExtractJob(id, encodeJob(total, attempts, results))
+					_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: interruptedReason(i, total, r.Err), SectionsDone: i, SectionsTotal: total, At: time.Now().Unix()})
+				} else {
+					_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: extractFailureReason(r.Err), At: time.Now().Unix()})
+				}
+				return
+			}
+			// A timeout. Give the section another, longer try — unless its attempts are used up.
+			attempts++
+			if attempts >= maxSectionAttempts {
+				break
+			}
+			if multi {
+				// Persist the raised attempt count so a crash-restart resumes the stretched read, not restarts it.
+				_ = s.docs.SetExtractJob(id, encodeJob(total, attempts, results))
+			}
 		}
+
+		if r.Err != nil && errors.Is(r.Err, context.DeadlineExceeded) && attempts >= maxSectionAttempts {
+			// Structurally too slow even stretched: abandon THIS section. A multi-section read names it as
+			// unread (so the gap is disclosed, Kein stummes Ausbleiben) and carries on; a single-section file
+			// has nothing else to read, so this is the whole, named failure.
+			if !multi {
+				_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: tooSlowReason(), At: time.Now().Unix()})
+				return
+			}
+			r = extract.SectionResult{Label: sections[i].Label, Err: errSectionTooSlow}
+		}
+
 		results = append(results, r)
+		attempts = 0
 		if multi {
-			_ = s.docs.SetExtractJob(id, encodeJob(total, results))
+			_ = s.docs.SetExtractJob(id, encodeJob(total, attempts, results))
 			_ = s.docs.SetExtract(id, store.Extract{State: "reading", SectionsDone: len(results), SectionsTotal: total})
 		}
 	}
@@ -198,12 +260,14 @@ type jobSection struct {
 }
 type jobState struct {
 	Total    int          `json:"total"`
+	Attempts int          `json:"attempts,omitempty"` // reads already spent on the next (in-progress) section, so a stretched deadline survives a resume
 	Sections []jobSection `json:"sections"`
 }
 
-// encodeJob serializes the completed sections of a read for resume.
-func encodeJob(total int, results []extract.SectionResult) []byte {
-	js := jobState{Total: total, Sections: make([]jobSection, 0, len(results))}
+// encodeJob serializes the completed sections of a read, plus the attempt count of the section it is on,
+// for resume.
+func encodeJob(total, attempts int, results []extract.SectionResult) []byte {
+	js := jobState{Total: total, Attempts: attempts, Sections: make([]jobSection, 0, len(results))}
 	for _, r := range results {
 		s := jobSection{Label: r.Label, Text: r.Text, Engine: r.Engine, Model: r.Model, TooBig: r.TooBig}
 		if r.Err != nil {
@@ -215,12 +279,13 @@ func encodeJob(total int, results []extract.SectionResult) []byte {
 	return b
 }
 
-// decodeJob reads a resume job back into section results, but only when it belongs to the SAME plan
-// (same total section count) — a mismatch (aigentic's limit changed, so the split differs) starts fresh.
-func decodeJob(raw []byte, total int) ([]extract.SectionResult, bool) {
+// decodeJob reads a resume job back into section results plus the in-progress section's attempt count, but
+// only when it belongs to the SAME plan (same total section count) — a mismatch (aigentic's limit changed,
+// so the split differs) starts fresh.
+func decodeJob(raw []byte, total int) ([]extract.SectionResult, int, bool) {
 	var js jobState
 	if err := json.Unmarshal(raw, &js); err != nil || js.Total != total {
-		return nil, false
+		return nil, 0, false
 	}
 	out := make([]extract.SectionResult, 0, len(js.Sections))
 	for _, s := range js.Sections {
@@ -230,7 +295,18 @@ func decodeJob(raw []byte, total int) ([]extract.SectionResult, bool) {
 		}
 		out = append(out, r)
 	}
-	return out, true
+	return out, js.Attempts, true
+}
+
+// errSectionTooSlow marks a section abandoned because it kept exceeding the read deadline even after the
+// deadline was stretched — a structurally too-slow section, distinct from a transient engine outage. It is
+// named in the assembled text so the gap is disclosed (Kein stummes Ausbleiben) rather than silently lost.
+var errSectionTooSlow = errors.New("it kept exceeding the read time limit even after the deadline was stretched")
+
+// tooSlowReason names a whole-file (single-section) read abandoned because it kept exceeding the deadline
+// even stretched, so the user knows a plain retry would only repeat it.
+func tooSlowReason() string {
+	return "This file kept exceeding the read time limit even after the deadline was stretched, so its text could not be read."
 }
 
 // sectionBudget is the raw bytes ONE section may carry, derived from aigentic's published per-request
