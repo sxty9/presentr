@@ -5,10 +5,8 @@ import {
   Button,
   ContextMenu,
   Divider,
-  DropdownMenu,
   Field,
   FileEntryIcon,
-  FileInput,
   FilePreview,
   FileTextIcon,
   FileThumb,
@@ -17,19 +15,17 @@ import {
   Markdown,
   Modal,
   Panel,
-  PlusIcon,
   ProgressBar,
   Stack,
   Text,
   Textarea,
   TrashIcon,
-  UploadIcon,
+  UploadControl,
   XIcon,
   cn,
   useLiveQuery,
   useT,
   type FileEntry,
-  type FileInputHandle,
   type ServiceApiClient,
   type ServiceContextProps,
   type TextPayload,
@@ -76,11 +72,6 @@ interface UploadItem {
   reason?: string;
   controller?: AbortController;
 }
-// The file kinds the pool accepts (aigentic reads these). A picker hint only — drag/drop and paste
-// bypass it and the server re-checks every file by sniffing its bytes.
-const ACCEPT_HINT =
-  'image/png,image/jpeg,image/gif,image/webp,application/pdf,text/*,.md,.markdown,.csv,.json,.log,.yaml,.yml,.toml,.ini';
-
 // formatSize renders a byte count the way a user reads it — "70 MB", "1.4 MB" — for the rejection
 // message, so a turned-away file shows its actual weight next to the limit.
 function formatSize(bytes: number): string {
@@ -113,7 +104,6 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
   const [busy, setBusy] = useState(false);
 
   const [dragging, setDragging] = useState(false);
-  const fileInputRef = useRef<FileInputHandle>(null);
 
   // The live per-file upload rows and a ref mirror of them, so the sequential queue runner and the
   // cancel handler can read the current status without going stale between renders.
@@ -125,7 +115,6 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
   const uploadKey = useRef(0);
   const queueRef = useRef<Promise<void>>(Promise.resolve());
   const uploadApi = api as UploadCapableApi;
-  const uploading = uploads.some((u) => u.status === 'queued' || u.status === 'uploading');
 
   function patchUpload(key: string, p: Partial<UploadItem>) {
     setUploads((list) => list.map((it) => (it.key === key ? { ...it, ...p } : it)));
@@ -347,23 +336,20 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
             {t('presentr.docsSubtitle')}
           </Text>
         </Stack>
-        {/* The hidden picker is the SDK's headless file input, opened from the "Add" menu below — a
-            service never renders a raw <input> itself (the SDK owns media/file DOM). */}
-        <FileInput ref={fileInputRef} accept={ACCEPT_HINT} multiple onFiles={enqueue} />
+        {/* The two ways knowledge enters the pool, side by side under one heading: compose typed
+            text, or bring in existing files. Picking loose files AND picking a whole folder are
+            unified in the shared SDK's UploadControl — the single access point for a file collection,
+            folder selection included — so a service never renders a raw <input> itself (the SDK owns
+            media/file DOM). Both paths land on the same enqueue()/submit() below; the backend pool is
+            passive and every write is atomic. */}
         <Stack gap={1} align="end">
-          <DropdownMenu
-            align="end"
-            trigger={
-              <Button variant="primary" iconLeft={<PlusIcon />} loading={uploading}>
-                {t('presentr.add')}
-              </Button>
-            }
-            items={[
-              { id: 'text', label: t('presentr.addText'), icon: <FileTextIcon />, onSelect: () => setAdding(true) },
-              { id: 'files', label: t('presentr.uploadFiles'), icon: <UploadIcon />, onSelect: () => fileInputRef.current?.open() },
-            ]}
-          />
-          {/* The access point names what it accepts — kinds and size — so the limit is known before it
+          <Stack direction="row" gap={2} align="center">
+            <Button variant="secondary" iconLeft={<FileTextIcon />} onClick={() => setAdding(true)}>
+              {t('presentr.addText')}
+            </Button>
+            <UploadControl onFiles={enqueue} label={t('presentr.uploadFiles')} variant="primary" />
+          </Stack>
+          {/* The access point names what it accepts — the size limit — so the limit is known before it
               is reached (Intuitiv by Design), not discovered through a failed upload. */}
           <Text variant="caption" color="tertiary">
             {t('presentr.uploadHint', { limit: MAX_FILE_MIB })}
