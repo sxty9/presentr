@@ -133,38 +133,87 @@ func TestSplitPDFByPagesCoversEveryPageOnce(t *testing.T) {
 	}
 }
 
-// Prepare splits an over-budget scanned-style PDF into multiple AI sections, and keeps a small PDF as a
-// single section.
-func TestPrepareChunksLargePDF(t *testing.T) {
-	small := multiPagePDF(t, 2, 0)
-	plan, err := Prepare("application/pdf", withImageMarker(small), 10<<20)
+// A text-layer PDF is read from its text layer regardless of whether it also embeds an image — the text
+// track never depends on the image track. A multi-page text PDF with a bare (unreferenced) image marker
+// has no decodable image, so it is a pure local read; its text is present and it needs no AI sections.
+func TestPreparePureTextLayerNeedsNoAI(t *testing.T) {
+	plan, err := Prepare("application/pdf", multiPagePDF(t, 2, 0), 10<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Local {
-		t.Fatal("an image-bearing PDF must be read by AI, not locally")
+	if plan.LocalText == "" || plan.Source != "text-layer" {
+		t.Fatalf("a text-layer PDF must be read locally: source=%q text=%q", plan.Source, plan.LocalText)
 	}
-	if len(plan.Sections) != 1 {
-		t.Fatalf("a small PDF should be one section, got %d", len(plan.Sections))
-	}
-
-	big := withImageMarker(multiPagePDF(t, 8, 3000))
-	plan2, err := Prepare("application/pdf", big, 4000)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plan2.Sections) < 2 {
-		t.Fatalf("a large PDF over budget must split into sections, got %d", len(plan2.Sections))
-	}
-	for _, s := range plan2.Sections {
-		if s.TooBig {
-			t.Fatalf("section %s should fit the budget", s.Label)
-		}
+	if len(plan.Sections) != 0 {
+		t.Fatalf("a text PDF with no decodable image needs no AI sections, got %d", len(plan.Sections))
 	}
 }
 
-// withImageMarker appends a bare image XObject so pdfWantsAI routes the PDF to the AI path (the split is
-// only ever needed for the AI path).
-func withImageMarker(pdf []byte) []byte {
-	return append(append([]byte{}, pdf...), []byte("\n999 0 obj<< /Subtype /Image /Width 1 >>endobj")...)
+// A large PDF with NO readable text layer (a scan this reader cannot open) still falls back to the AI
+// whole-document / page-split path, so nothing is lost. splitPDFByPages itself is covered directly by
+// TestSplitPDFByPagesCoversEveryPageOnce; here the fallback ROUTING is checked: an incoherent-text,
+// image-free PDF over budget produces AI sections rather than a local read.
+func TestPrepareScanFallsBackToPageSplit(t *testing.T) {
+	// A multi-page PDF whose content streams are binary noise (no coherent text layer) and whose pages
+	// reference no image, padded past a tiny budget so the fallback must split it.
+	scan := noTextMultiPagePDF(t, 6, 2000)
+	plan, err := Prepare("application/pdf", scan, 3000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.LocalText != "" {
+		t.Fatalf("a scan with no coherent text layer must not be read locally: %q", plan.LocalText)
+	}
+	if len(plan.Sections) < 2 {
+		t.Fatalf("an over-budget scan must fall back to several page sections, got %d", len(plan.Sections))
+	}
+}
+
+// noTextMultiPagePDF builds an n-page PDF whose content streams are binary noise (no text-show operators),
+// so the text-layer reader rejects it as incoherent and the file routes to the AI fallback. Per-page
+// padding lets it be pushed over a small budget so the fallback must split it.
+func noTextMultiPagePDF(t *testing.T, n, pad int) []byte {
+	t.Helper()
+	var objs [][]byte
+	add := func(s string) int { objs = append(objs, []byte(s)); return len(objs) }
+	addStream := func(dict, stream string) int {
+		var b bytes.Buffer
+		b.WriteString(dict[:len(dict)-2])
+		fmt.Fprintf(&b, " /Length %d >>\nstream\n%s\nendstream", len(stream), stream)
+		objs = append(objs, b.Bytes())
+		return len(objs)
+	}
+	_ = add("<< /Type /Catalog /Pages 2 0 R >>")
+	pagesIdx := add("")
+	var pages []int
+	for i := 0; i < n; i++ {
+		// Binary noise plus padding — no BT/Tj, so pdfTextLayer finds nothing coherent.
+		noise := strings.Repeat("\x01\x02\x03\x04", 8+pad/4)
+		cIdx := addStream("<< >>", noise)
+		pIdx := add(fmt.Sprintf("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents %d 0 R >>", cIdx))
+		pages = append(pages, pIdx)
+	}
+	var kids strings.Builder
+	for i, p := range pages {
+		if i > 0 {
+			kids.WriteByte(' ')
+		}
+		fmt.Fprintf(&kids, "%d 0 R", p)
+	}
+	objs[pagesIdx-1] = []byte(fmt.Sprintf("<< /Type /Pages /Kids [ %s ] /Count %d >>", kids.String(), n))
+
+	var buf bytes.Buffer
+	buf.WriteString("%PDF-1.4\n")
+	offs := make([]int, len(objs)+1)
+	for i, body := range objs {
+		offs[i+1] = buf.Len()
+		fmt.Fprintf(&buf, "%d 0 obj\n%s\nendobj\n", i+1, body)
+	}
+	x := buf.Len()
+	fmt.Fprintf(&buf, "xref\n0 %d\n0000000000 65535 f \n", len(objs)+1)
+	for i := 1; i <= len(objs); i++ {
+		fmt.Fprintf(&buf, "%010d 00000 n \n", offs[i])
+	}
+	fmt.Fprintf(&buf, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF", len(objs)+1, x)
+	return buf.Bytes()
 }

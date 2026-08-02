@@ -49,12 +49,21 @@ type Document struct {
 	ExtractSize   int64  `json:"extractSize,omitempty"`   // byte length of the extract text (storage accounting)
 	ExtractedAt   int64  `json:"extractedAt,omitempty"`   // epoch seconds the read completed
 
-	// Section progress for a LARGE file read in pieces (state "reading"): a scanned PDF too big for one
-	// AI request is split into page-sized sections and read one at a time, so the state can say "section
-	// 7 of 40" instead of only "pending" (Portionierte Daten — the UI shows how far, not the pieces
-	// themselves). Zero for a small file read in one pass.
-	ExtractSectionsDone  int `json:"extractSectionsDone,omitempty"`
-	ExtractSectionsTotal int `json:"extractSectionsTotal,omitempty"`
+	// Two independent read tracks, shown separately so the user follows each (Portionierte Daten):
+	//   - The TEXT track: a PDF's machine-readable text layer, read exactly and locally the instant the
+	//     read starts (no AI wait). ExtractTextLayer marks that this file HAS such a track, so the UI can
+	//     show it as read immediately while the image track is still working.
+	//   - The IMAGE track: each embedded picture (a photographed nameplate, a scan) read on its own by the
+	//     vision AI, downscaled first. ExtractSectionsDone/Total count the images read out of how many, and
+	//     ExtractSectionLabel names the most recent one by page ("image on page 6") so progress reads
+	//     "image on page 6 — 3 of 6" rather than a single opaque counter. A large scan with NO text layer
+	//     reuses these counters for its page-range sections. Zero/empty for a file read in one pass.
+	// While a text-layer file's images are still being read the state is already "ready" (its text is
+	// usable) with ExtractSectionsDone < ExtractSectionsTotal — the image track keeps augmenting it.
+	ExtractTextLayer     bool   `json:"extractTextLayer,omitempty"`
+	ExtractSectionsDone  int    `json:"extractSectionsDone,omitempty"`
+	ExtractSectionsTotal int    `json:"extractSectionsTotal,omitempty"`
+	ExtractSectionLabel  string `json:"extractSectionLabel,omitempty"`
 }
 
 // Extract is the outcome of reading a file document's text, produced OUTSIDE the pool (the pool is
@@ -70,10 +79,13 @@ type Extract struct {
 	Error  string // reason, when State=="failed"
 	At     int64  // epoch seconds the read completed (stamped by the caller)
 
-	// Progress for a chunked read (State "reading"/"failed" mid-way): how many page-sized sections have
-	// been read, out of how many. Left zero for a single-pass read.
+	// Two-track progress. TextLayer marks that a text-layer track was read exactly (the text track).
+	// SectionsDone/Total and SectionLabel track the image track (images read out of how many, and the
+	// page label of the most recent one). Left zero/empty for a single-pass read with no images.
+	TextLayer     bool
 	SectionsDone  int
 	SectionsTotal int
+	SectionLabel  string
 }
 
 // docState is the whole on-disk document: the room's flat, ordered list of items.
@@ -262,13 +274,19 @@ func (p *DocPool) SetExtract(id string, ex Extract) error {
 	switch ex.State {
 	case "pending":
 		d.ExtractState = "pending"
+		d.ExtractTextLayer = false
 		d.ExtractSectionsDone, d.ExtractSectionsTotal = 0, 0
+		d.ExtractSectionLabel = ""
 	case "reading":
 		// A chunked read is in progress: record how far it has got, leaving any prior text intact.
 		d.ExtractState = "reading"
+		d.ExtractTextLayer = ex.TextLayer
 		d.ExtractSectionsDone = ex.SectionsDone
 		d.ExtractSectionsTotal = ex.SectionsTotal
+		d.ExtractSectionLabel = ex.SectionLabel
 	case "ready":
+		// The text is usable. The image track may STILL be running (SectionsDone < SectionsTotal), so the
+		// counters are kept rather than cleared — they show the image track augmenting an already-usable read.
 		d.ExtractState = "ready"
 		d.ExtractSource = ex.Source
 		d.ExtractModel = ex.Model
@@ -276,14 +294,18 @@ func (p *DocPool) SetExtract(id string, ex Extract) error {
 		d.ExtractError = ""
 		d.ExtractSize = int64(len(ex.Text))
 		d.ExtractedAt = ex.At
-		d.ExtractSectionsDone, d.ExtractSectionsTotal = 0, 0
+		d.ExtractTextLayer = ex.TextLayer
+		d.ExtractSectionsDone, d.ExtractSectionsTotal = ex.SectionsDone, ex.SectionsTotal
+		d.ExtractSectionLabel = ex.SectionLabel
 	case "failed":
 		d.ExtractState = "failed"
 		d.ExtractError = ex.Error
 		d.ExtractedAt = ex.At
+		d.ExtractTextLayer = ex.TextLayer
 		// Keep the section counters so a resumable failure still shows how far it got.
 		if ex.SectionsTotal > 0 {
 			d.ExtractSectionsDone, d.ExtractSectionsTotal = ex.SectionsDone, ex.SectionsTotal
+			d.ExtractSectionLabel = ex.SectionLabel
 		}
 	default:
 		return nil
@@ -294,8 +316,10 @@ func (p *DocPool) SetExtract(id string, ex Extract) error {
 		p.st.Docs = prev
 		return err
 	}
-	// A completed read no longer needs its resume job; drop it best-effort once the metadata is committed.
-	if ex.State == "ready" {
+	// A COMPLETED read no longer needs its resume job; drop it once the metadata is committed. A "ready"
+	// read whose image track is still running (SectionsDone < SectionsTotal) keeps its job so a restart
+	// resumes the remaining images rather than re-reading them.
+	if ex.State == "ready" && ex.SectionsDone >= ex.SectionsTotal {
 		_ = os.Remove(filepath.Join(p.jobDir, id))
 	}
 	return err

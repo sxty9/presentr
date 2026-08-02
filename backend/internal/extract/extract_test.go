@@ -5,6 +5,8 @@ import (
 	"compress/zlib"
 	"context"
 	"errors"
+	"fmt"
+	"image/jpeg"
 	"strings"
 	"testing"
 )
@@ -103,6 +105,30 @@ func TestRunFlatePDFTextLayer(t *testing.T) {
 	}
 }
 
+// A full-resolution embedded image is DOWNSCALED before it is sent to the AI: its long edge is capped
+// and it is re-encoded as a compact JPEG. This is the change that lets a photo-heavy PDF be read at all —
+// a 15-megabyte sensor frame no longer ships whole.
+func TestEmbeddedImageIsDownscaledForVision(t *testing.T) {
+	pdf := rgbImagePDF(t, "spec sheet", 2400, 60) // a wide image, long edge 2400 > the 1568 cap
+	secs, skipped, ok := extractImageSections(pdf, 20<<20)
+	if !ok || len(secs) != 1 || skipped != 0 {
+		t.Fatalf("expected one decodable image section, got ok=%v n=%d skipped=%d", ok, len(secs), skipped)
+	}
+	if secs[0].Mime != "image/jpeg" {
+		t.Fatalf("a downscaled image must be sent as JPEG, got %q", secs[0].Mime)
+	}
+	img, err := jpeg.Decode(bytes.NewReader(secs[0].Data))
+	if err != nil {
+		t.Fatalf("the section must be a valid JPEG: %v", err)
+	}
+	if b := img.Bounds(); b.Dx() > visionLongEdge || b.Dy() > visionLongEdge {
+		t.Fatalf("the image must be downscaled to a %d px long edge, got %dx%d", visionLongEdge, b.Dx(), b.Dy())
+	}
+	if b := img.Bounds(); b.Dx() != visionLongEdge {
+		t.Fatalf("a 2400px-wide image should scale its long edge exactly to %d, got %d", visionLongEdge, b.Dx())
+	}
+}
+
 // CASE 2 — an image with text on it is READ by the AI (its transcription is stored, labelled with the
 // model that produced it).
 func TestRunImageUsesAI(t *testing.T) {
@@ -119,21 +145,109 @@ func TestRunImageUsesAI(t *testing.T) {
 	}
 }
 
-// A PDF that embeds a raster image is routed to the AI even though it also has a text layer, because
-// text may live inside the image (a photographed nameplate) which only vision reads.
-func TestRunImageBearingPDFUsesAI(t *testing.T) {
-	ai := &stubAI{text: "read by vision", engine: "claude", model: "claude"}
-	// A text-layer PDF, with an image XObject marker added so pdfHasImages routes it to AI.
-	pdf := append(textPDF(t, "some text"), []byte("\n9 0 obj<< /Subtype /Image /Width 10 >>stream\n\x00\x01endstream endobj")...)
+// rgbImagePDF builds a one-page PDF that carries BOTH a machine-readable text layer (the shown string)
+// AND a real, decodable embedded image (an uncompressed DeviceRGB raster referenced by the page's
+// resources). It is the shape of the feature's target file — a LaTeX-style document with photos — so the
+// two independent tracks (exact text layer, AI-read image) can be exercised together.
+func rgbImagePDF(t *testing.T, show string, w, h int) []byte {
+	t.Helper()
+	px := bytes.Repeat([]byte{0x80, 0x80, 0x80}, w*h) // a flat gray raster; decodes cleanly to an image
+	content := "BT /F1 12 Tf 72 720 Td (" + show + ") Tj ET"
+	// The content stream (4) is placed BEFORE the image (5): the text-layer reader takes a window of the
+	// bytes preceding each `stream` to spot an /Image marker, so a content stream must not sit right after
+	// an image object — exactly how a real producer lays a page out (content, then its image resources).
+	objs := []string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 6 0 R >> /XObject << /Im0 5 0 R >> >> /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+		"", // 4: content stream, built below
+		"", // 5: image XObject, built below (has a stream)
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+	}
+	var buf bytes.Buffer
+	buf.WriteString("%PDF-1.4\n")
+	offs := make([]int, len(objs)+1)
+	writeObj := func(num int, dict, stream string) {
+		offs[num] = buf.Len()
+		buf.WriteString(itoa(num))
+		buf.WriteString(" 0 obj\n")
+		buf.WriteString(dict)
+		if stream != "" {
+			buf.WriteString("\nstream\n")
+			buf.WriteString(stream)
+			buf.WriteString("\nendstream")
+		}
+		buf.WriteString("\nendobj\n")
+	}
+	for i, body := range objs {
+		num := i + 1
+		switch num {
+		case 4:
+			writeObj(4, "<< /Length "+itoa(len(content))+" >>", content)
+		case 5:
+			dict := "<< /Type /XObject /Subtype /Image /Width " + itoa(w) + " /Height " + itoa(h) +
+				" /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length " + itoa(len(px)) + " >>"
+			writeObj(5, dict, string(px))
+		default:
+			writeObj(num, body, "")
+		}
+	}
+	x := buf.Len()
+	buf.WriteString("xref\n0 ")
+	buf.WriteString(itoa(len(objs) + 1))
+	buf.WriteString("\n0000000000 65535 f \n")
+	for num := 1; num <= len(objs); num++ {
+		fmt.Fprintf(&buf, "%010d 00000 n \n", offs[num])
+	}
+	fmt.Fprintf(&buf, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF", len(objs)+1, x)
+	return buf.Bytes()
+}
+
+// The two tracks run INDEPENDENTLY: a PDF that has both a text layer and an embedded image reads the
+// text EXACTLY and locally (no AI, no waiting), and reads the image SEPARATELY with the vision AI — the
+// presence of the image never drags the text into the AI path. The assembled extract carries both, and
+// the image's text is labelled by the page it came from.
+func TestRunTextAndImagesAreIndependentTracks(t *testing.T) {
+	ai := &stubAI{text: "SN 9931 on the nameplate", engine: "claude", model: "claude-sonnet-4-6"}
+	pdf := rgbImagePDF(t, "Projector Epson EB-2250U", 8, 8)
 	res, err := Run(context.Background(), "ada", "mixed.pdf", "application/pdf", pdf, ai)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if !ai.called {
-		t.Fatal("an image-bearing PDF must be routed to the AI (vision reads text inside images)")
+	if ai.gotMime != "image/jpeg" {
+		t.Fatalf("the embedded image must be downscaled and sent as a JPEG, got mime %q", ai.gotMime)
 	}
-	if res.Source != "ai" {
-		t.Fatalf("source = %q, want ai", res.Source)
+	if !strings.Contains(res.Text, "Projector Epson EB-2250U") {
+		t.Fatalf("the text layer must be read exactly and locally: %q", res.Text)
+	}
+	if !strings.Contains(res.Text, "SN 9931 on the nameplate") {
+		t.Fatalf("the image text must be read by the AI and included: %q", res.Text)
+	}
+	if !strings.Contains(res.Text, "Image on page 1") {
+		t.Fatalf("the image text must be labelled by its page: %q", res.Text)
+	}
+	if res.Source != "mixed" {
+		t.Fatalf("a PDF read from both tracks is source %q, want mixed", res.Source)
+	}
+	if res.Model != "claude-sonnet-4-6" {
+		t.Fatalf("a mixed read must carry the model that read its images, got %q", res.Model)
+	}
+}
+
+// The text track NEVER depends on the AI: a text-layer PDF with an embedded image whose text the AI
+// cannot read (no AI configured) still yields the exact text layer, with the image named as an
+// undisclosed gap rather than failing the whole read.
+func TestRunTextLayerSurvivesWhenImageUnreadable(t *testing.T) {
+	pdf := rgbImagePDF(t, "HDMI 1 wired to the wall plate", 8, 8)
+	res, err := Run(context.Background(), "ada", "mixed.pdf", "application/pdf", pdf, nil) // no AI
+	if err != nil {
+		t.Fatalf("Run must not fail when only the image track cannot be read: %v", err)
+	}
+	if !strings.Contains(res.Text, "wall plate") {
+		t.Fatalf("the exact text layer must survive with no AI: %q", res.Text)
+	}
+	if res.Source != "text-layer" {
+		t.Fatalf("with only the text track read, source = %q, want text-layer", res.Source)
 	}
 }
 

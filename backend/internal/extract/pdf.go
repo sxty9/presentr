@@ -3,10 +3,11 @@ package extract
 // A small, dependency-free PDF text-layer reader. It exists for ONE narrow job: read the
 // machine-readable text of a digitally-generated PDF locally, exactly and with no AI. It deliberately
 // does NOT try to be a full PDF engine — anything it cannot read cleanly (a scanned page, a PDF whose
-// fonts use a custom/subset encoding, an image-bearing PDF) is routed to aigentic's extract instead
-// (see Run/pdfWantsAI), which reads text INSIDE images too. So this reader only has to handle the easy,
-// common case well; the coherence gate (coherent) and the image check (pdfHasImages) send everything
-// else to the AI path. It uses only the standard library (compress/zlib, compress/flate).
+// fonts use a custom/subset encoding) is left to aigentic's extract instead (see pdfPlan), which reads
+// text INSIDE images too. The text layer is ALWAYS read when it is coherent, whether or not the PDF also
+// embeds images — the images are their own, separate track (pdfimages.go), so a photo never blocks the
+// text. The coherence gate (coherent) rejects a garbled decode so a bad read falls back to the AI path.
+// It uses only the standard library (compress/zlib, compress/flate).
 
 import (
 	"bytes"
@@ -14,6 +15,7 @@ import (
 	"compress/zlib"
 	"encoding/hex"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -23,51 +25,31 @@ import (
 // document that the sibling chunking order handles; here it simply reads what fits.
 const maxPDFScan = 32 << 20
 
-// pdfWantsAI reports whether a PDF should be read by AI rather than from its text layer. The rule: any
-// PDF that embeds a raster image is read by AI, because an image may carry text that only vision reads
-// — a photographed rating plate, a scanned page — which is exactly the content this feature exists to
-// capture. Only a PDF with NO embedded image is a candidate for the exact, no-AI text-layer read.
-func pdfWantsAI(data []byte) bool {
-	return pdfHasImages(data)
-}
-
-// pdfHasImages reports whether the PDF embeds any raster image. It first scans the raw bytes for the
-// image-XObject marker (present in cleartext in most scanned/exported PDFs), then, only if needed,
-// decompresses streams to catch PDFs whose object dictionaries are themselves compressed (PDF 1.5+
-// object streams). Biased toward "yes": a false positive merely routes a file to AI (safe, complete),
-// while a miss could drop text baked into a photo — the thing we must not lose.
-func pdfHasImages(data []byte) bool {
-	if bytes.Contains(data, []byte("/Image")) {
-		return true
-	}
-	scanned := 0
-	for _, s := range pdfStreams(data) {
-		dec, ok := pdfDecodeStream(s)
-		if !ok {
-			continue
-		}
-		if bytes.Contains(dec, []byte("/Image")) {
-			return true
-		}
-		scanned += len(dec)
-		if scanned >= maxPDFScan {
-			break
-		}
-	}
-	return false
-}
-
 // pdfTextLayer reads the text of a PDF from its content streams and reports whether the result is
 // trustworthy (coherent) — a caller uses the text only when ok is true, else it falls back to AI. It
-// decompresses each content stream and pulls the operands of the text-show operators (Tj, TJ, ', ").
+// walks the PDF's indirect objects (scanObjects, which delimits each object's dictionary PRECISELY and
+// resolves stream lengths), skips the image XObjects, decompresses each remaining content stream and
+// pulls the operands of the text-show operators (Tj, TJ, ', "). Using the exact object dictionary — not a
+// fixed window of bytes before the stream — is what lets the text layer be read reliably even in a photo-
+// heavy PDF where content streams sit right next to image objects (the two tracks are independent).
 func pdfTextLayer(data []byte) (string, bool) {
+	objs := scanObjects(data)
+	nums := make([]int, 0, len(objs))
+	for n := range objs {
+		nums = append(nums, n)
+	}
+	sort.Ints(nums) // object-number order is a stable, reasonable reading order for the assembled text
 	var out strings.Builder
 	scanned := 0
-	for _, s := range pdfStreams(data) {
-		if bytes.Contains(s.dict, []byte("/Image")) {
-			continue // image data, not a content stream
+	for _, n := range nums {
+		o := objs[n]
+		if !o.hasStream {
+			continue
 		}
-		dec, ok := pdfDecodeStream(s)
+		if dictHasNameValue(o.dict, "/Subtype", "/Image") {
+			continue // an image XObject, not a content stream — the image track reads it, not this
+		}
+		dec, ok := pdfDecodeStream(pdfStream{dict: o.dict, body: o.stream})
 		if !ok {
 			continue
 		}
@@ -84,55 +66,11 @@ func pdfTextLayer(data []byte) (string, bool) {
 	return text, coherent(text)
 }
 
-// pdfStream is one raw PDF stream: the dictionary bytes just before the `stream` keyword (so /Filter
-// and /Subtype can be read) and the stream body bytes.
+// pdfStream is one raw PDF stream: the dictionary bytes (so /Filter and /Subtype can be read) and the
+// stream body bytes. It is the small value pdfDecodeStream operates on.
 type pdfStream struct {
 	dict []byte
 	body []byte
-}
-
-// pdfStreams splits a PDF into its streams by scanning for the `stream`/`endstream` keyword pair. It
-// captures a window of bytes before each `stream` as the dictionary region (enough to see /Filter and
-// /Subtype). This is a lexical scan, not a full parse — sufficient because the text/image decisions
-// only need the filter name and a marker, and anything ambiguous is routed to AI anyway.
-func pdfStreams(data []byte) []pdfStream {
-	var streams []pdfStream
-	i := 0
-	for {
-		rel := bytes.Index(data[i:], []byte("stream"))
-		if rel < 0 {
-			break
-		}
-		kw := i + rel
-		// Guard against matching the tail of "endstream".
-		if kw >= 3 && bytes.Equal(data[kw-3:kw], []byte("end")) {
-			i = kw + 6
-			continue
-		}
-		dictStart := kw - 1024
-		if dictStart < 0 {
-			dictStart = 0
-		}
-		dict := data[dictStart:kw]
-		// The stream data starts after the `stream` keyword and its trailing EOL (CRLF or LF).
-		b := kw + len("stream")
-		if b < len(data) && data[b] == '\r' {
-			b++
-		}
-		if b < len(data) && data[b] == '\n' {
-			b++
-		}
-		endRel := bytes.Index(data[b:], []byte("endstream"))
-		if endRel < 0 {
-			break
-		}
-		body := data[b : b+endRel]
-		// Trim the EOL that precedes `endstream`.
-		body = bytes.TrimRight(body, "\r\n")
-		streams = append(streams, pdfStream{dict: dict, body: body})
-		i = b + endRel + len("endstream")
-	}
-	return streams
 }
 
 // pdfDecodeStream returns a stream's bytes ready to read: FlateDecode streams are inflated (zlib, with

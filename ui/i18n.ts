@@ -56,14 +56,16 @@ registerMessages({
     'presentr.deleteConfirm': 'Remove this document from the room pool? This cannot be undone.',
     'presentr.deleteFailed': 'Could not delete the document',
 
-    // Text extraction — the text read once out of an uploaded file (a PDF's text layer, or the text on
-    // a photo/scan, recognized by the assistant), kept beside the file and used to answer questions.
+    // Text extraction — the text read once out of an uploaded file, kept beside the file and used to
+    // answer questions. It has TWO independent tracks: the text layer (read exactly and locally, no AI)
+    // and the embedded images (each read on its own by the assistant, named by the page it sits on).
     'presentr.extractReading': 'Reading text…',
-    'presentr.extractReadingSections': 'Reading — section {done} of {total}',
+    'presentr.extractReadingSections': 'Reading — image {done} of {total}',
     'presentr.extractUnread': 'Text not read',
     'presentr.extractReadHeading': 'Text read from this file',
     'presentr.extractFromLayer': 'Read from the document’s text layer — exact, no AI used.',
     'presentr.extractFromAI': 'Text recognized by the assistant (including text on photos and scans), read by {model}.',
+    'presentr.extractFromMixed': 'Text layer read exactly (no AI); the photos in it were read by {model}.',
     'presentr.extractPendingBody': 'Reading the text out of this file. This runs once; you can keep working.',
     'presentr.extractReadingBody': 'This file is large, so it is read in {total} sections. Reading section {done} of {total} — you can keep working; it continues where it left off if interrupted.',
     'presentr.extractFailedBody': 'The text of this file could not be read. {reason}',
@@ -73,6 +75,16 @@ registerMessages({
     'presentr.extractHide': 'Hide the read text',
     'presentr.extractEmpty': 'No legible text was found in this file.',
     'presentr.extractLoadFailed': 'Could not load the read text',
+    // The two tracks, shown side by side while a file is read.
+    'presentr.trackTextHeading': 'Text',
+    'presentr.trackTextReady': 'Text layer read — exact, no AI',
+    'presentr.trackTextNone': 'No text layer — read from images',
+    'presentr.trackImagesHeading': 'Images',
+    'presentr.trackImagesProgress': '{done} of {total} images read',
+    'presentr.trackImagesCurrent': 'Reading {label} — {done} of {total}',
+    'presentr.trackImagesReady': '{total} images read',
+    'presentr.trackImageBadge': 'Images {done}/{total}',
+    'presentr.extractImagesIncomplete': 'The text is ready. Some images have not been read yet — read the remaining images again.',
 
     // Connection tab (the wiring diagram, derived from the documents and editable by hand)
     'presentr.diagramHeading': 'Connection diagram',

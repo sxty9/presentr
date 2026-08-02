@@ -24,16 +24,22 @@ export interface Document {
   // with the text, not the raw bytes. state drives what the UI shows; a file uploaded before this
   // feature carries an empty state.
   extractState?: 'pending' | 'reading' | 'ready' | 'failed' | '';
-  extractSource?: string; // "text-layer" (read exactly, no AI) | "ai" (recognized from an image/scan)
-  extractModel?: string; // the AI model that read it, when source is "ai" (Kennzeichnungspflicht)
+  extractSource?: string; // "text-layer" (read exactly, no AI) | "ai" (from images) | "mixed" (both)
+  extractModel?: string; // the AI model that read it, when images were read (Kennzeichnungspflicht)
   extractEngine?: string;
   extractError?: string; // why the read failed (state "failed"); a retry can clear it
   extractSize?: number;
 
-  // Progress for a LARGE file read in page-sized sections (state "reading"): "section 7 of 40". Zero
-  // for a small file read in one pass. The split is a backend detail — the document stays ONE item.
+  // Two independent read tracks, shown separately (the task's decoupling):
+  //   - The TEXT track: extractTextLayer marks that this file's text layer was read exactly and locally,
+  //     the instant the read began — no AI wait. Shown as read immediately, even while images still read.
+  //   - The IMAGE track: extractSectionsDone/Total count the embedded images read out of how many, and
+  //     extractSectionLabel names the most recent one by page ("image on page 6"). A text-layer file whose
+  //     images are still being read is already state "ready" (its text is usable) with done < total.
+  extractTextLayer?: boolean;
   extractSectionsDone?: number;
   extractSectionsTotal?: number;
+  extractSectionLabel?: string;
 }
 
 // GET docs/{id}/extract — a file's read state plus the text that was read, so the UI can show exactly
@@ -45,8 +51,10 @@ export interface ExtractResponse {
   engine: string;
   error: string;
   size: number;
+  textLayer: boolean;
   sectionsDone: number;
   sectionsTotal: number;
+  sectionLabel: string;
   text: string;
 }
 
