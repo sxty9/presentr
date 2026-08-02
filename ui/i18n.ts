@@ -59,11 +59,13 @@ registerMessages({
     // Text extraction — the text read once out of an uploaded file (a PDF's text layer, or the text on
     // a photo/scan, recognized by the assistant), kept beside the file and used to answer questions.
     'presentr.extractReading': 'Reading text…',
+    'presentr.extractReadingSections': 'Reading — section {done} of {total}',
     'presentr.extractUnread': 'Text not read',
     'presentr.extractReadHeading': 'Text read from this file',
     'presentr.extractFromLayer': 'Read from the document’s text layer — exact, no AI used.',
     'presentr.extractFromAI': 'Text recognized by the assistant (including text on photos and scans), read by {model}.',
     'presentr.extractPendingBody': 'Reading the text out of this file. This runs once; you can keep working.',
+    'presentr.extractReadingBody': 'This file is large, so it is read in {total} sections. Reading section {done} of {total} — you can keep working; it continues where it left off if interrupted.',
     'presentr.extractFailedBody': 'The text of this file could not be read. {reason}',
     'presentr.extractRetry': 'Read again',
     'presentr.extractRetryFailed': 'Could not start reading the file again',

@@ -15,8 +15,11 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"presentr/internal/aigentic"
@@ -25,9 +28,16 @@ import (
 	"presentr/internal/store"
 )
 
-// extractTimeout bounds one background read. AI recognition of a big scanned PDF is slow, so this is
-// generous; it exists only so a stuck upstream call cannot pin a worker forever.
+// extractTimeout bounds ONE section read (a whole small file, or one page range of a split PDF). AI
+// recognition of a scanned page is slow, so this is generous; it exists only so a stuck upstream call
+// cannot pin a worker forever. A large PDF read is many sections, each bounded by this.
 const extractTimeout = 5 * time.Minute
+
+// fallbackRequestLimit is the conservative per-request byte ceiling presentr assumes when it could not
+// learn aigentic's own (RefreshRequestLimit) — aigentic's documented request cap. It is a FLOOR used
+// only until the real limit is known, never the authority: the boundary belongs to aigentic and is
+// asked for, not guessed (the Schnittstellen-Axiom).
+const fallbackRequestLimit = 32 << 20
 
 // aiExtractor adapts the aigentic client to extract.AIExtractor. A nil client (assistant not
 // configured) yields a nil extractor, so extract.Run reports ErrNoAI — a named, retriable reason.
@@ -68,9 +78,12 @@ func (s *Server) startExtraction(id string) {
 func (s *Server) WaitExtractions() { s.extractWG.Wait() }
 
 // runExtraction reads one file document's text and stores the outcome. It reads the file's bytes from
-// the pool (never the browser), runs the read outside the pool, and hands the result back via
-// SetExtract. Every ending is a stored, named state: ready (with the text and its source), or failed
-// (with a reason a retry can clear). Runs synchronously; startExtraction is the async wrapper.
+// the pool (never the browser), plans the read outside the pool (a local text-layer read, a single AI
+// request, or — for a scanned PDF too big for one request — a split into page-sized sections), and hands
+// the result back via SetExtract. Every ending is a stored, named state: ready (text + source), or
+// failed (with a reason a retry can clear). A large read reports PROGRESS as "reading" with a section
+// count, persists a resume job after each section, and — if the engine drops out mid-way — leaves a
+// named, RESUMABLE failed state rather than starting over. Runs synchronously; startExtraction wraps it.
 func (s *Server) runExtraction(id string) {
 	d, ok := s.docs.Get(id)
 	if !ok || d.Kind != "file" {
@@ -81,16 +94,177 @@ func (s *Server) runExtraction(id string) {
 		_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: "the file's stored bytes could not be read", At: time.Now().Unix()})
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), extractTimeout)
-	defer cancel()
-	res, err := extract.Run(ctx, d.Author, d.Title, d.Mime, b, s.extractor())
+	plan, err := extract.Prepare(d.Mime, b, s.sectionBudget())
 	if err != nil {
 		_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: extractFailureReason(err), At: time.Now().Unix()})
 		return
 	}
-	_ = s.docs.SetExtract(id, store.Extract{
-		State: "ready", Text: res.Text, Source: res.Source, Model: res.Model, Engine: res.Engine, At: time.Now().Unix(),
-	})
+	// A text file or a PDF with a readable text layer is read locally — exact, no AI, no sections.
+	if plan.Local {
+		_ = s.docs.SetExtract(id, store.Extract{State: "ready", Text: plan.LocalText, Source: plan.Source, At: time.Now().Unix()})
+		return
+	}
+	ai := s.extractor()
+	if ai == nil {
+		_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: extractFailureReason(extract.ErrNoAI), At: time.Now().Unix()})
+		return
+	}
+	s.readSections(id, d.Author, d.Title, plan.Sections, ai)
+}
+
+// readSections reads a file's AI sections one at a time, assembling the text and keeping the document's
+// state honest throughout. For a single section it behaves like the old single-pass read. For many
+// (a split PDF) it shows progress ("section 7 of 40"), persists a resume job after each section so an
+// interruption continues rather than restarts, and names any section that could not be read.
+func (s *Server) readSections(id, subject, title string, sections []extract.Section, ai extract.AIExtractor) {
+	total := len(sections)
+	multi := total > 1
+
+	// Resume: if a prior run of THIS same plan (same section count) left completed sections behind, reuse
+	// them and continue — never re-read a section already read (the task's "nicht von vorn").
+	var results []extract.SectionResult
+	if multi {
+		if raw, ok := s.docs.ExtractJob(id); ok {
+			if done, ok := decodeJob(raw, total); ok {
+				results = done
+			}
+		}
+	}
+	resumeFrom := len(results)
+	if resumeFrom > total {
+		resumeFrom = total
+		results = results[:total]
+	}
+	if multi {
+		_ = s.docs.SetExtract(id, store.Extract{State: "reading", SectionsDone: resumeFrom, SectionsTotal: total})
+	}
+
+	for i := resumeFrom; i < total; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), extractTimeout)
+		r := extract.ReadSection(ctx, ai, subject, title, sections[i])
+		cancel()
+		// A dropped engine (or a cancelled/timed-out call) is an INTERRUPTION, not a per-section verdict:
+		// stop, keep what is read, and leave a named, resumable failed state. A retry (reExtract) or a
+		// restart (ResumePending, for the "reading" state) continues from exactly here.
+		if r.Err != nil && !r.TooBig && isRetryableAbort(r.Err) {
+			if multi {
+				_ = s.docs.SetExtractJob(id, encodeJob(total, results))
+				_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: interruptedReason(i, total, r.Err), SectionsDone: i, SectionsTotal: total, At: time.Now().Unix()})
+			} else {
+				_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: extractFailureReason(r.Err), At: time.Now().Unix()})
+			}
+			return
+		}
+		results = append(results, r)
+		if multi {
+			_ = s.docs.SetExtractJob(id, encodeJob(total, results))
+			_ = s.docs.SetExtract(id, store.Extract{State: "reading", SectionsDone: len(results), SectionsTotal: total})
+		}
+	}
+
+	res, anyText := extract.AssembleText(results)
+	if !anyText {
+		// Nothing legible came out of any section (e.g. a lone oversized image, or every page unreadable).
+		// Fail with a named reason rather than store an empty "ready", and clear the resume job so a retry
+		// re-reads from the start rather than replaying the same empty result.
+		if multi {
+			_ = s.docs.SetExtractJob(id, nil)
+		}
+		_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: noTextReason(results), SectionsDone: total, SectionsTotal: total, At: time.Now().Unix()})
+		return
+	}
+	_ = s.docs.SetExtract(id, store.Extract{State: "ready", Text: res.Text, Source: res.Source, Model: res.Model, Engine: res.Engine, At: time.Now().Unix()})
+}
+
+// isRetryableAbort reports whether a section-read error means the WHOLE read was interrupted (the engine
+// is unavailable, or the call was cancelled/timed out) rather than a verdict on that one section — so the
+// read is left resumable instead of marking every remaining section as failed.
+func isRetryableAbort(err error) bool {
+	return errors.Is(err, aigentic.ErrUnavailable) ||
+		errors.Is(err, aigentic.ErrDisabled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled)
+}
+
+// jobSection is one completed section, persisted so an interrupted read resumes. jobState is the whole
+// resume job (the plan's section count plus the sections read so far, in order).
+type jobSection struct {
+	Label  string `json:"label"`
+	Text   string `json:"text"`
+	Engine string `json:"engine"`
+	Model  string `json:"model"`
+	TooBig bool   `json:"tooBig"`
+	Err    string `json:"err,omitempty"`
+}
+type jobState struct {
+	Total    int          `json:"total"`
+	Sections []jobSection `json:"sections"`
+}
+
+// encodeJob serializes the completed sections of a read for resume.
+func encodeJob(total int, results []extract.SectionResult) []byte {
+	js := jobState{Total: total, Sections: make([]jobSection, 0, len(results))}
+	for _, r := range results {
+		s := jobSection{Label: r.Label, Text: r.Text, Engine: r.Engine, Model: r.Model, TooBig: r.TooBig}
+		if r.Err != nil {
+			s.Err = r.Err.Error()
+		}
+		js.Sections = append(js.Sections, s)
+	}
+	b, _ := json.Marshal(js)
+	return b
+}
+
+// decodeJob reads a resume job back into section results, but only when it belongs to the SAME plan
+// (same total section count) — a mismatch (aigentic's limit changed, so the split differs) starts fresh.
+func decodeJob(raw []byte, total int) ([]extract.SectionResult, bool) {
+	var js jobState
+	if err := json.Unmarshal(raw, &js); err != nil || js.Total != total {
+		return nil, false
+	}
+	out := make([]extract.SectionResult, 0, len(js.Sections))
+	for _, s := range js.Sections {
+		r := extract.SectionResult{Label: s.Label, Text: s.Text, Engine: s.Engine, Model: s.Model, TooBig: s.TooBig}
+		if s.Err != "" {
+			r.Err = errors.New(s.Err)
+		}
+		out = append(out, r)
+	}
+	return out, true
+}
+
+// sectionBudget is the raw bytes ONE section may carry, derived from aigentic's published per-request
+// limit (asked for via RefreshRequestLimit, not guessed). It reserves room for the base64 envelope a
+// binary section expands into plus the prompt, so a section that fits the budget still fits one request.
+func (s *Server) sectionBudget() int {
+	limit := s.aiLimit.Load()
+	if limit <= 0 {
+		limit = fallbackRequestLimit
+	}
+	reserve := limit / 16
+	if reserve > 1<<20 {
+		reserve = 1 << 20
+	}
+	// base64 expands bytes by 4/3, so keep the raw section to ~7/10 of the request budget for headroom.
+	budget := (limit - reserve) * 7 / 10
+	if budget < 1 {
+		budget = limit / 2
+	}
+	return int(budget)
+}
+
+// RefreshRequestLimit asks aigentic for its per-request byte ceiling and caches it, so the section split
+// follows aigentic's own limit rather than a baked-in guess. Best-effort and bounded: a disabled client
+// or an unreachable/older aigentic leaves the conservative fallback in place. Called once at start.
+func (s *Server) RefreshRequestLimit() {
+	if s.ai == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if n, ok := s.ai.RequestLimit(ctx); ok {
+		s.aiLimit.Store(n)
+	}
 }
 
 // extractFailureReason turns a read error into a plain, user-facing sentence naming why the text could
@@ -100,7 +274,7 @@ func extractFailureReason(err error) string {
 	case errors.Is(err, extract.ErrNoAI):
 		return "The room assistant is not configured, so text in images and scans cannot be read yet. Retry once it is set up."
 	case errors.Is(err, extract.ErrTooLargeForAI):
-		return "This file is too large for the assistant to read in one pass. Splitting it into sections is a separate, planned step."
+		return "This part of the file is too large for the assistant to read even on its own, so it could not be read."
 	case errors.Is(err, aigentic.ErrUnavailable):
 		return "No AI engine was available to read the file. Retry once an engine is connected."
 	default:
@@ -108,12 +282,42 @@ func extractFailureReason(err error) string {
 	}
 }
 
-// ResumePending re-launches the read of any file left in the "pending" state — a document whose upload
-// landed but whose read did not finish before the daemon stopped. Called once at start, so a pending
-// state always ENDS rather than lingering forever after a restart (Kein stummes Ausbleiben).
+// interruptedReason names a chunked read that stopped mid-way because the engine dropped out, telling the
+// user exactly how far it got and that a retry continues from there rather than starting over.
+func interruptedReason(done, total int, err error) string {
+	return fmt.Sprintf("The read was interrupted after section %d of %d (%s). Retry to continue from where it stopped.",
+		done, total, strings.TrimSpace(shortReason(err)))
+}
+
+// shortReason gives the interruption a short human cause.
+func shortReason(err error) string {
+	switch {
+	case errors.Is(err, aigentic.ErrUnavailable), errors.Is(err, aigentic.ErrDisabled):
+		return "no AI engine was available"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "a section took too long"
+	default:
+		return "the read was cancelled"
+	}
+}
+
+// noTextReason names why a read produced no text at all, from the section results.
+func noTextReason(results []extract.SectionResult) string {
+	for _, r := range results {
+		if r.TooBig {
+			return "This file is too large for the assistant to read in one request and could not be split into smaller parts, so its text could not be read."
+		}
+	}
+	return "No legible text could be read from this file. You can retry."
+}
+
+// ResumePending re-launches the read of any file left mid-read — "pending" (its upload landed but the
+// read had not begun) or "reading" (a chunked read that a crash interrupted between sections). Called
+// once at start, so such a state always ENDS rather than lingering after a restart (Kein stummes
+// Ausbleiben); a chunked read resumes from its persisted job, not from the first page.
 func (s *Server) ResumePending() {
 	for _, d := range s.docs.List() {
-		if d.Kind == "file" && d.ExtractState == "pending" {
+		if d.Kind == "file" && (d.ExtractState == "pending" || d.ExtractState == "reading") {
 			s.startExtraction(d.ID)
 		}
 	}
@@ -130,13 +334,15 @@ func (s *Server) getExtract(w http.ResponseWriter, r *http.Request, _ *auth.User
 	}
 	text, _ := s.docs.ExtractText(id)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"state":  d.ExtractState,
-		"source": d.ExtractSource,
-		"model":  d.ExtractModel,
-		"engine": d.ExtractEngine,
-		"error":  d.ExtractError,
-		"size":   d.ExtractSize,
-		"text":   text,
+		"state":         d.ExtractState,
+		"source":        d.ExtractSource,
+		"model":         d.ExtractModel,
+		"engine":        d.ExtractEngine,
+		"error":         d.ExtractError,
+		"size":          d.ExtractSize,
+		"sectionsDone":  d.ExtractSectionsDone,
+		"sectionsTotal": d.ExtractSectionsTotal,
+		"text":          text,
 	})
 }
 

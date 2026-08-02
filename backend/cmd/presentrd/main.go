@@ -63,8 +63,13 @@ func main() {
 	)
 
 	app := api.New(v, docs, chats, diagram, ai)
+	// Ask aigentic for its per-request byte ceiling, so a large file is split into sections sized to
+	// aigentic's OWN limit rather than a baked-in guess (best-effort; a conservative floor stands in
+	// until it answers).
+	app.RefreshRequestLimit()
 	// Resume reading any file whose upload landed but whose text read did not finish before a previous
-	// stop — so a "reading…" state always ENDS rather than lingering after a restart.
+	// stop — so a "reading…" state always ENDS rather than lingering after a restart. A chunked read
+	// resumes from where it stopped, not from the first page.
 	app.ResumePending()
 
 	srv := &http.Server{

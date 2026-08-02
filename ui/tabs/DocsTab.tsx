@@ -407,7 +407,11 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
                   onDelete={() => remove(d.id)}
                   openLabel={t('presentr.openFile')}
                   deleteLabel={t('presentr.delete')}
-                  readingLabel={t('presentr.extractReading')}
+                  readingLabel={
+                    d.extractState === 'reading' && (d.extractSectionsTotal ?? 0) > 1
+                      ? t('presentr.extractReadingSections', { done: d.extractSectionsDone ?? 0, total: d.extractSectionsTotal ?? 0 })
+                      : t('presentr.extractReading')
+                  }
                   unreadLabel={t('presentr.extractUnread')}
                 />
               ))
@@ -557,9 +561,12 @@ function DocRow({
           </Stack>
         </Stack>
         <Stack direction="row" align="center" gap={2} className="shrink-0">
-          {/* At-a-glance read state for a file: a file being read, or one whose read failed, shows a
-              badge; a successfully read file needs no attention and shows none (Intuitiv by Design). */}
-          {doc.kind === 'file' && doc.extractState === 'pending' && <Badge variant="neutral">{readingLabel}</Badge>}
+          {/* At-a-glance read state for a file: a file being read (a large one shows how far — "section 7
+              of 40"), or one whose read failed, shows a badge; a successfully read file needs no attention
+              and shows none (Intuitiv by Design). */}
+          {doc.kind === 'file' && (doc.extractState === 'pending' || doc.extractState === 'reading') && (
+            <Badge variant="neutral">{readingLabel}</Badge>
+          )}
           {doc.kind === 'file' && doc.extractState === 'failed' && <Badge variant="danger">{unreadLabel}</Badge>}
           <IconButton
             label={deleteLabel}
@@ -643,12 +650,20 @@ function ExtractSection({
     }
   }
 
-  if (state === 'pending') {
+  if (state === 'pending' || state === 'reading') {
+    // A large file is read in page-sized sections: show how far along, so the wait is "section 7 of 40",
+    // never a blank spinner. An interruption resumes from here rather than starting over.
+    const total = doc.extractSectionsTotal ?? 0;
+    const done = doc.extractSectionsDone ?? 0;
+    const chunked = state === 'reading' && total > 1;
     return (
-      <Stack gap={1} align="start">
-        <Badge variant="neutral">{t('presentr.extractReading')}</Badge>
+      <Stack gap={2} align="start" className="w-full">
+        <Badge variant="neutral">
+          {chunked ? t('presentr.extractReadingSections', { done, total }) : t('presentr.extractReading')}
+        </Badge>
+        {chunked && <ProgressBar value={Math.round((done / total) * 100)} tone="accent" className="w-full" />}
         <Text variant="caption" color="tertiary">
-          {t('presentr.extractPendingBody')}
+          {chunked ? t('presentr.extractReadingBody', { done, total }) : t('presentr.extractPendingBody')}
         </Text>
       </Stack>
     );

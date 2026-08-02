@@ -38,7 +38,8 @@ import (
 const (
 	docPrefix     = "documents"
 	blobPrefix    = "blobs"
-	extractPrefix = "extracts" // the derived extract text of a file document, one node per document
+	extractPrefix = "extracts"     // the derived extract text of a file document, one node per document
+	jobPrefix     = "extract-jobs" // an in-progress chunked-read job, so a large read resumes after a crash
 )
 
 // NewDocStore returns the scheme-backed document backend (selected because this file's `scheme`
@@ -275,6 +276,11 @@ func (s *SchemeDocs) SetExtract(id string, ex Extract) error {
 	switch ex.State {
 	case "pending":
 		d.ExtractState = "pending"
+		d.ExtractSectionsDone, d.ExtractSectionsTotal = 0, 0
+	case "reading":
+		d.ExtractState = "reading"
+		d.ExtractSectionsDone = ex.SectionsDone
+		d.ExtractSectionsTotal = ex.SectionsTotal
 	case "ready":
 		d.ExtractState = "ready"
 		d.ExtractSource = ex.Source
@@ -283,10 +289,14 @@ func (s *SchemeDocs) SetExtract(id string, ex Extract) error {
 		d.ExtractError = ""
 		d.ExtractSize = int64(len(ex.Text))
 		d.ExtractedAt = ex.At
+		d.ExtractSectionsDone, d.ExtractSectionsTotal = 0, 0
 	case "failed":
 		d.ExtractState = "failed"
 		d.ExtractError = ex.Error
 		d.ExtractedAt = ex.At
+		if ex.SectionsTotal > 0 {
+			d.ExtractSectionsDone, d.ExtractSectionsTotal = ex.SectionsDone, ex.SectionsTotal
+		}
 	default:
 		return nil
 	}
@@ -294,7 +304,39 @@ func (s *SchemeDocs) SetExtract(id string, ex Extract) error {
 	if err != nil {
 		return err
 	}
-	return s.putLocked(docPrefix+"/"+id, desc, meta)
+	if err := s.putLocked(docPrefix+"/"+id, desc, meta); err != nil {
+		return err
+	}
+	if ex.State == "ready" {
+		_ = s.deleteLocked(jobPrefix + "/" + id) // a completed read no longer needs its resume job
+	}
+	return nil
+}
+
+// SetExtractJob stores the in-progress chunked-read job as a described node beside the extract, so a
+// large read resumes rather than restarting after a crash or engine outage. The same entity through the
+// one access point (no second store).
+func (s *SchemeDocs) SetExtractJob(id string, job []byte) error {
+	if id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.putLocked(jobPrefix+"/"+id, "extract-read-job", job)
+}
+
+// ExtractJob returns a document's persisted chunked-read job, and whether one is present.
+func (s *SchemeDocs) ExtractJob(id string) ([]byte, bool) {
+	if id == "" {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok, err := s.getBytes(jobPrefix + "/" + id)
+	if err != nil || !ok {
+		return nil, false
+	}
+	return b, true
 }
 
 // ExtractText returns a file document's derived text (its extracts/<id> node), and whether present.
@@ -323,7 +365,10 @@ func (s *SchemeDocs) Delete(id string) error {
 	if err := s.deleteLocked(blobPrefix + "/" + id); err != nil {
 		return err
 	}
-	return s.deleteLocked(extractPrefix + "/" + id)
+	if err := s.deleteLocked(extractPrefix + "/" + id); err != nil {
+		return err
+	}
+	return s.deleteLocked(jobPrefix + "/" + id)
 }
 
 // deleteLocked removes one node at path (caller holds s.mu). Idempotent.

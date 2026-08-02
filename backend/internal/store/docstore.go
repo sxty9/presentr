@@ -55,5 +55,13 @@ type DocStore interface {
 	// ExtractText returns a file document's derived text (a bounded read — an extract is text, far
 	// smaller than its source file), for the AI grounding, and whether it was found.
 	ExtractText(id string) (string, bool)
+	// SetExtractJob persists the in-progress job of a chunked read (a large PDF read page-range by
+	// page-range), so a read interrupted by a crash or an engine outage RESUMES rather than restarting.
+	// It rides beside the extract text as part of the SAME entity (no second store), computed outside
+	// the pool and handed in. Cleared automatically when the read completes (SetExtract "ready") or the
+	// document is deleted. Carried by BOTH backends.
+	SetExtractJob(id string, job []byte) error
+	// ExtractJob returns a document's persisted chunked-read job, and whether one is present.
+	ExtractJob(id string) ([]byte, bool)
 	Delete(id string) error
 }

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"presentr/internal/aigentic"
@@ -59,6 +60,10 @@ type Server struct {
 	// extractWG tracks in-flight background reads so they can be drained (a graceful stop, and a
 	// deterministic test that must not race a temp-dir cleanup).
 	extractWG sync.WaitGroup
+	// aiLimit caches aigentic's published per-request byte ceiling (0 ⇒ not learned; the fallback floor
+	// is used). It is the boundary presentr ASKS aigentic for rather than guessing (RefreshRequestLimit),
+	// and it sizes the sections a large file is split into. A test may set it to force small sections.
+	aiLimit atomic.Int64
 }
 
 // maxConcurrentExtractions caps parallel background reads (see extractSem).
