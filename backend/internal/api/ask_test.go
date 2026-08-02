@@ -27,12 +27,12 @@ func TestRoomGrounding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	parts, omitted := s.roomGrounding()
+	parts, gaps := s.roomGrounding()
 	if len(parts) != 3 {
 		t.Fatalf("grounding has %d parts, want 3: %+v", len(parts), parts)
 	}
-	if len(omitted) != 0 {
-		t.Fatalf("small documents must not be omitted: %+v", omitted)
+	if len(gaps.omitted) != 0 || len(gaps.notRead) != 0 || len(gaps.unread) != 0 {
+		t.Fatalf("small legacy documents must not be flagged as gaps: %+v", gaps)
 	}
 	byPath := map[string]aigentic.InlineFile{}
 	for _, p := range parts {
@@ -60,12 +60,56 @@ func TestRoomGroundingNamesOmittedDocuments(t *testing.T) {
 	big := strings.Repeat("x", maxGroundingBytes+1)
 	_ = s.docs.Add(store.Document{ID: store.NewID(), Title: "Huge manual", Kind: "text", Mime: "text/markdown", Content: big})
 
-	parts, omitted := s.roomGrounding()
+	parts, gaps := s.roomGrounding()
 	if len(parts) != 1 || parts[0].Path != "Fits" {
 		t.Fatalf("grounding should carry only the fitting document, got %+v", parts)
 	}
-	if len(omitted) != 1 || omitted[0] != "Huge manual" {
-		t.Fatalf("the oversized document must be named as omitted, got %+v", omitted)
+	if len(gaps.omitted) != 1 || gaps.omitted[0] != "Huge manual" {
+		t.Fatalf("the oversized document must be named as omitted, got %+v", gaps.omitted)
+	}
+}
+
+// A file grounds by the TEXT read out of it (the extract), not its raw bytes — so a big scanned file
+// costs a question a few hundred bytes of text, not megabytes of base64. A file whose read is still
+// pending or has failed is not sent at all; it is named as a gap so the answer can disclose it.
+func TestRoomGroundingUsesExtractAndNamesUnreadFiles(t *testing.T) {
+	s := newServer(t)
+	// A ready file: its bytes are a large image, but its read produced a short text — the grounding
+	// must carry the TEXT, never the bytes.
+	bigImage := bytes.Repeat([]byte{0x89, 'P', 'N', 'G'}, 300000) // ~1.2 MB of "image" bytes
+	if _, err := s.docs.AddFile(store.Document{ID: "ready", Title: "nameplate.png", Kind: "file", Mime: "image/png", ExtractState: "pending"}, bytes.NewReader(bigImage), 100<<20); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.docs.SetExtract("ready", store.Extract{State: "ready", Text: "Model EB-2250U, HDMI 1", Source: "ai", Model: "claude"}); err != nil {
+		t.Fatal(err)
+	}
+	// A pending file and a failed file: both named, neither sent.
+	if _, err := s.docs.AddFile(store.Document{ID: "pend", Title: "scan.pdf", Kind: "file", Mime: "application/pdf", ExtractState: "pending"}, bytes.NewReader([]byte("%PDF-1.7")), 100<<20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.docs.AddFile(store.Document{ID: "fail", Title: "broken.pdf", Kind: "file", Mime: "application/pdf", ExtractState: "pending"}, bytes.NewReader([]byte("%PDF-1.7")), 100<<20); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.docs.SetExtract("fail", store.Extract{State: "failed", Error: "no AI"}); err != nil {
+		t.Fatal(err)
+	}
+
+	parts, gaps := s.roomGrounding()
+	if len(parts) != 1 {
+		t.Fatalf("only the ready file should be grounded, got %d parts: %+v", len(parts), parts)
+	}
+	if parts[0].Path != "nameplate.png" || parts[0].MediaType != "text/markdown" || parts[0].Content != "Model EB-2250U, HDMI 1" {
+		t.Fatalf("ready file must ground by its extract TEXT (not bytes): %+v", parts[0])
+	}
+	if len(gaps.notRead) != 1 || gaps.notRead[0] != "scan.pdf" {
+		t.Fatalf("a pending file must be named as not-read: %+v", gaps.notRead)
+	}
+	if len(gaps.unread) != 1 || gaps.unread[0] != "broken.pdf" {
+		t.Fatalf("a failed file must be named as unread: %+v", gaps.unread)
+	}
+	note := groundingNote(gaps)
+	if !strings.Contains(note, "scan.pdf") || !strings.Contains(note, "broken.pdf") {
+		t.Fatalf("the grounding note must disclose both unread files: %q", note)
 	}
 }
 

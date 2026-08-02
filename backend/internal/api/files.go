@@ -132,14 +132,17 @@ func (s *Server) uploadFiles(w http.ResponseWriter, r *http.Request, u *auth.Use
 			continue
 		}
 		// Author the complete record outside the pool, then stream the bytes over for passive
-		// storage; the pool stamps Size from the bytes it writes and reports an over-limit file.
+		// storage; the pool stamps Size from the bytes it writes and reports an over-limit file. The
+		// document lands in the "pending" read state: its text is read ONCE, right after it arrives (a
+		// background step, see startExtraction below), not on every later question.
 		d := store.Document{
-			ID:      store.NewID(),
-			Title:   name,
-			Kind:    "file",
-			Mime:    mime,
-			Author:  u.Username,
-			Created: time.Now().Unix(),
+			ID:           store.NewID(),
+			Title:        name,
+			Kind:         "file",
+			Mime:         mime,
+			Author:       u.Username,
+			Created:      time.Now().Unix(),
+			ExtractState: "pending",
 		}
 		n, err := s.docs.AddFile(d, io.MultiReader(bytes.NewReader(head), part), maxFileBytes)
 		part.Close()
@@ -156,6 +159,9 @@ func (s *Server) uploadFiles(w http.ResponseWriter, r *http.Request, u *auth.Use
 			continue
 		}
 		d.Size = n
+		// Read the file's text once, now, in the background — the upload answers immediately with the
+		// document in "pending", and the read flips it to ready/failed (surfaced in the list the UI polls).
+		s.startExtraction(d.ID)
 		accepted = append(accepted, d)
 	}
 
@@ -183,16 +189,39 @@ func isBodyTooLarge(err error) bool {
 	return errors.As(err, &e)
 }
 
-// getRaw streams a file document's raw bytes so the SDK viewers can render it (an image as an image,
-// a PDF as a readable PDF). It STREAMS the blob straight from storage via http.ServeContent rather
-// than buffering it, so serving a 100 MB file costs no matching chunk of memory, and range requests
-// (a PDF viewer seeking, a video scrubbing) are answered from the seekable blob. Read-only and
-// right-gated; text documents carry no bytes and 404 here.
+// getRaw serves a document's bytes so the SDK viewers can render it and the download control can
+// save it — whatever the document's kind. It is the ONE way to fetch a document's bytes (Zugangspunkt
+// wiederverwenden): a file's raw bytes are STREAMED straight from storage via http.ServeContent
+// rather than buffered, so serving a 100 MB file costs no matching chunk of memory and range requests
+// (a PDF viewer seeking, a video scrubbing) are answered from the seekable blob; a typed text
+// document carries no out-of-band blob, so its markdown is served from the inline record. The viewer
+// navigates one pool across all kinds, so a text note downloads the same as an image. Read-only and
+// right-gated.
 func (s *Server) getRaw(w http.ResponseWriter, r *http.Request, _ *auth.User) {
 	id := r.PathValue("id")
 	d, ok := s.docs.Get(id)
-	if !ok || d.Kind != "file" {
+	if !ok {
 		writeErr(w, http.StatusNotFound, "File not found")
+		return
+	}
+	mime := d.Mime
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	// nosniff: serve exactly the stored type, so an uploaded file can never be reinterpreted as
+	// active content by the browser. ServeContent honours this Content-Type (it only sniffs when the
+	// header is unset).
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Disposition", "inline; filename=\""+sanitizeHeaderFilename(d.Title)+"\"")
+	w.Header().Set("Cache-Control", "private, no-store")
+	// A typed text document's markdown lives inline in the record, not as an out-of-band blob; serve
+	// it from there. Fall back to text/markdown when the record carries no mime.
+	if d.Kind != "file" {
+		if mime == "application/octet-stream" {
+			mime = "text/markdown; charset=utf-8"
+		}
+		w.Header().Set("Content-Type", mime)
+		http.ServeContent(w, r, d.Title, time.Unix(d.Created, 0), strings.NewReader(d.Content))
 		return
 	}
 	rc, _, ok := s.docs.OpenBlob(id)
@@ -201,17 +230,7 @@ func (s *Server) getRaw(w http.ResponseWriter, r *http.Request, _ *auth.User) {
 		return
 	}
 	defer rc.Close()
-	mime := d.Mime
-	if mime == "" {
-		mime = "application/octet-stream"
-	}
 	w.Header().Set("Content-Type", mime)
-	// nosniff: serve exactly the stored type, so an uploaded file can never be reinterpreted as
-	// active content by the browser. ServeContent honours this Content-Type (it only sniffs when the
-	// header is unset).
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Disposition", "inline; filename=\""+sanitizeHeaderFilename(d.Title)+"\"")
-	w.Header().Set("Cache-Control", "private, no-store")
 	http.ServeContent(w, r, d.Title, time.Unix(d.Created, 0), rc)
 }
 

@@ -19,6 +19,28 @@ export interface Document {
   size: number;
   author: string;
   created: number;
+
+  // Extraction — the text read once out of a file (kind "file") and kept beside it, so questions work
+  // with the text, not the raw bytes. state drives what the UI shows; a file uploaded before this
+  // feature carries an empty state.
+  extractState?: 'pending' | 'ready' | 'failed' | '';
+  extractSource?: string; // "text-layer" (read exactly, no AI) | "ai" (recognized from an image/scan)
+  extractModel?: string; // the AI model that read it, when source is "ai" (Kennzeichnungspflicht)
+  extractEngine?: string;
+  extractError?: string; // why the read failed (state "failed"); a retry can clear it
+  extractSize?: number;
+}
+
+// GET docs/{id}/extract — a file's read state plus the text that was read, so the UI can show exactly
+// what the assistant will draw on.
+export interface ExtractResponse {
+  state: string;
+  source: string;
+  model: string;
+  engine: string;
+  error: string;
+  size: number;
+  text: string;
 }
 
 // GET docs — the room's documents, newest first.
@@ -34,29 +56,23 @@ export interface UploadResponse {
   rejected?: { name: string; reason: string }[];
 }
 
-// One turn in the room-assistant conversation (backend internal/store.Message). model/engine label
-// an assistant turn with the aigentic model that produced it; empty on user turns.
-export interface ChatMessage {
-  role: 'user' | 'assistant';
-  text: string;
-  model?: string;
-  engine?: string;
-  created: number;
-}
-
-// GET/PUT chats — the caller's conversation with the room assistant.
-export interface ChatHistory {
-  messages: ChatMessage[];
-}
+// The room-assistant conversation is stored as one OPAQUE per-account blob (GET/PUT chats), whose
+// shape — a list of conversations — is owned by the shared <Chat>'s presentr ChatAdapter (see
+// ui/chatAdapter.ts), the single source of truth. No typed message shape lives here: the backend
+// keeps the blob verbatim, so there is one data path to the conversations and no second, poorer one.
 
 // ── the room's AI (presentr's own backend grounds it and routes to aigentic) ──────────────────
 // POST ask — presentr's backend assembles the grounding from the pool (text AND uploaded files) and
-// runs the turn through aigentic on the caller's behalf, so the UI sends only the prompt and the
-// requested answer shape. Every answer carries the model/engine that produced it
-// (Kennzeichnungspflicht für KI-Modellantworten).
+// runs the turn through aigentic on the caller's behalf, so the UI sends only the prompt, the
+// requested answer shape, and the caller's chosen engine/model. Every answer carries the
+// model/engine that produced it (Kennzeichnungspflicht für KI-Modellantworten).
 export interface AskRequest {
   prompt: string;
   outputFormat?: 'text' | 'markdown' | 'json';
+  // The room chat's machine + model choice. Empty engine → "choose" (Auto) on the backend; the
+  // Connection diagram omits both and always runs on Auto.
+  engine?: string;
+  model?: string;
 }
 
 export interface AskResult {

@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   Badge,
+  Box,
   Button,
+  ContextMenu,
   Divider,
   DropdownMenu,
   Field,
   FileEntryIcon,
+  FileInput,
   FilePreview,
   FileTextIcon,
   FileThumb,
@@ -26,12 +29,13 @@ import {
   useLiveQuery,
   useT,
   type FileEntry,
+  type FileInputHandle,
   type ServiceApiClient,
   type ServiceContextProps,
   type TextPayload,
   type ViewerKind,
 } from '@holistic/ui';
-import type { DocsResponse, Document, UploadResponse } from '../types';
+import type { DocsResponse, Document, ExtractResponse, UploadResponse } from '../types';
 
 // The document pool — workflow stage 1. It takes in the room's knowledge three equal ways, exactly
 // as the axioms require of any surface that holds a collection of files: a picker, drag-and-drop onto
@@ -77,24 +81,6 @@ interface UploadItem {
 const ACCEPT_HINT =
   'image/png,image/jpeg,image/gif,image/webp,application/pdf,text/*,.md,.markdown,.csv,.json,.log,.yaml,.yml,.toml,.ini';
 
-// Open the OS file dialog as an ACTION, not a rendered surface. A service UI composes only
-// @holistic/ui components and renders no raw element — not even a hidden <input> — so the picker is
-// built on demand inside the click handler, opened, and its chosen files read back. The opening is a
-// Handlung, not a Fläche. (The SDK's UploadControl renders its OWN button + a folder option, which
-// would duplicate this tab's single "Add" access point and offer a folder upload presentr does not
-// take — so it does not fit here; Keine ähnlichen Geschwister.)
-function openFileDialog(accept: string, onFiles: (files: File[]) => void) {
-  const input = document.createElement('input');
-  input.type = 'file';
-  input.multiple = true;
-  input.accept = accept;
-  input.onchange = () => {
-    const files = Array.from(input.files ?? []);
-    if (files.length) onFiles(files);
-  };
-  input.click();
-}
-
 // formatSize renders a byte count the way a user reads it — "70 MB", "1.4 MB" — for the rejection
 // message, so a turned-away file shows its actual weight next to the limit.
 function formatSize(bytes: number): string {
@@ -127,6 +113,7 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
   const [busy, setBusy] = useState(false);
 
   const [dragging, setDragging] = useState(false);
+  const fileInputRef = useRef<FileInputHandle>(null);
 
   // The live per-file upload rows and a ref mirror of them, so the sequential queue runner and the
   // cancel handler can read the current status without going stale between renders.
@@ -233,11 +220,24 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
   const rawUrl = (id: string) => api.url(`docs/${id}/raw`);
   const thumbSources = { mediaUrl: (e: FileEntry) => rawUrl(e.path) };
 
+  // toPreviewEntry gives the viewer a FileEntry for ANY document kind: a file previews as its own
+  // media (image/pdf/text), while a typed text document previews as its inline markdown. The pool is
+  // one collection the viewer pages through — image, PDF, text in one pot — so both kinds resolve to
+  // an entry the shared FilePreview can render.
+  function toPreviewEntry(d: Document): FileEntry {
+    if (d.kind === 'file') return toEntry(d);
+    return { name: d.title, path: d.id, kind: 'file', size: d.size, mtime: d.created * 1000, mime: 'text/markdown', viewer: 'markdown' };
+  }
+
   function openPreview(d: Document) {
-    const e = toEntry(d);
+    const e = toPreviewEntry(d);
     setPreview(e);
     setPreviewText(null);
-    if (e.viewer === 'text' || e.viewer === 'markdown') {
+    if (d.kind !== 'file') {
+      // A typed text document's markdown is already inline in the record — render it without a
+      // round-trip. (Its bytes are also served by docs/{id}/raw, which the download control uses.)
+      setPreviewText({ content: d.content });
+    } else if (e.viewer === 'text' || e.viewer === 'markdown') {
       api
         .raw(`docs/${d.id}/raw`)
         .then((r) => r.text())
@@ -245,6 +245,15 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
         .catch(() => setPreviewText({ content: '' }));
     }
   }
+
+  // The preview pages over the whole pool in list order (Bild, PDF, Textdokument — ein Topf). The
+  // current position is found from the open entry's id; at the ends there is simply no prev/next, so
+  // the corresponding control is absent (the SDK renders it disabled) rather than a dead button.
+  const previewIndex = preview ? docs.findIndex((d) => d.id === preview.path) : -1;
+  const openAt = (i: number) => {
+    const d = docs[i];
+    if (d) openPreview(d);
+  };
 
   async function submit() {
     const ti = title.trim();
@@ -282,24 +291,29 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
     }
   }
 
-  // Keyboard navigation for the list (Tastaturnavigation in Listenelementen): arrows move the
-  // selection, Home/End jump to the ends, Enter opens a file's viewer, Delete/Backspace removes it.
+  // Keyboard navigation for the list (Tastaturnavigation in Listenelementen). The bare keys move the
+  // selection (arrows step, Home/End jump to the ends), Enter opens the selected document in the
+  // viewer, and Delete/Backspace removes it. The axioms require the common Cmd/Ctrl combinations too:
+  // Cmd/Ctrl+Arrow jumps to the far end of the list (as in a text field), and Cmd/Ctrl+Delete /
+  // Cmd/Ctrl+Backspace removes the selection (the macOS "move to trash" combo) — both go through the
+  // same confirm as a bare Delete.
   function onListKeyDown(e: React.KeyboardEvent) {
     if (docs.length === 0) return;
     const idx = docs.findIndex((d) => d.id === selectedId);
+    const mod = e.metaKey || e.ctrlKey; // Cmd on macOS, Ctrl elsewhere
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      setSelectedId(docs[Math.min(idx + 1, docs.length - 1)]?.id ?? docs[0].id);
+      setSelectedId(mod ? docs[docs.length - 1].id : docs[Math.min(idx + 1, docs.length - 1)]?.id ?? docs[0].id);
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
-      setSelectedId(idx <= 0 ? docs[0].id : docs[idx - 1].id);
+      setSelectedId(mod || idx <= 0 ? docs[0].id : docs[idx - 1].id);
     } else if (e.key === 'Home') {
       e.preventDefault();
       setSelectedId(docs[0].id);
     } else if (e.key === 'End') {
       e.preventDefault();
       setSelectedId(docs[docs.length - 1].id);
-    } else if (e.key === 'Enter' && selected?.kind === 'file') {
+    } else if (e.key === 'Enter' && selected) {
       e.preventDefault();
       openPreview(selected);
     } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) {
@@ -333,6 +347,9 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
             {t('presentr.docsSubtitle')}
           </Text>
         </Stack>
+        {/* The hidden picker is the SDK's headless file input, opened from the "Add" menu below — a
+            service never renders a raw <input> itself (the SDK owns media/file DOM). */}
+        <FileInput ref={fileInputRef} accept={ACCEPT_HINT} multiple onFiles={enqueue} />
         <Stack gap={1} align="end">
           <DropdownMenu
             align="end"
@@ -343,7 +360,7 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
             }
             items={[
               { id: 'text', label: t('presentr.addText'), icon: <FileTextIcon />, onSelect: () => setAdding(true) },
-              { id: 'files', label: t('presentr.uploadFiles'), icon: <UploadIcon />, onSelect: () => openFileDialog(ACCEPT_HINT, enqueue) },
+              { id: 'files', label: t('presentr.uploadFiles'), icon: <UploadIcon />, onSelect: () => fileInputRef.current?.open() },
             ]}
           />
           {/* The access point names what it accepts — kinds and size — so the limit is known before it
@@ -400,9 +417,12 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
                   doc={d}
                   selected={d.id === selectedId}
                   onSelect={() => setSelectedId(d.id)}
-                  onOpen={() => (d.kind === 'file' ? openPreview(d) : setSelectedId(d.id))}
+                  onOpen={() => openPreview(d)}
                   onDelete={() => remove(d.id)}
+                  openLabel={t('presentr.openFile')}
                   deleteLabel={t('presentr.delete')}
+                  readingLabel={t('presentr.extractReading')}
+                  unreadLabel={t('presentr.extractUnread')}
                 />
               ))
             ) : (
@@ -426,10 +446,16 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
               <Divider />
               {selected.kind === 'file' ? (
                 <Stack gap={3} align="start">
-                  <FileThumb entry={toEntry(selected)} sources={thumbSources} iconClassName="h-16 w-16" className="max-h-72 w-full" />
+                  {/* A PREVIEW shows WHAT the file is, so the image sits whole in its box in its own
+                      aspect ratio (fit="contain") — not the cropped, filling MINIATURE a grid tile
+                      wants (fit="cover"). The box carries a definite height so contain has something
+                      to letterbox within. Media rendering stays in the SDK; presentr only chooses fit. */}
+                  <FileThumb entry={toEntry(selected)} sources={thumbSources} fit="contain" iconClassName="h-16 w-16" className="h-72 w-full" />
                   <Button variant="secondary" onClick={() => openPreview(selected)}>
                     {t('presentr.openFile')}
                   </Button>
+                  <Divider />
+                  <ExtractSection api={api} ui={ui} doc={selected} t={t} onChanged={() => docsQ.refresh()} />
                 </Stack>
               ) : (
                 <Markdown text={selected.content} />
@@ -449,6 +475,8 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
         onOpenChange={(o) => {
           if (!o) setPreview(null);
         }}
+        onPrev={previewIndex > 0 ? () => openAt(previewIndex - 1) : undefined}
+        onNext={previewIndex >= 0 && previewIndex < docs.length - 1 ? () => openAt(previewIndex + 1) : undefined}
         onDownload={(e) => window.open(rawUrl(e.path), '_blank', 'noopener')}
       />
 
@@ -489,56 +517,198 @@ function DocRow({
   onSelect,
   onOpen,
   onDelete,
+  openLabel,
   deleteLabel,
+  readingLabel,
+  unreadLabel,
 }: {
   doc: Document;
   selected: boolean;
   onSelect: () => void;
   onOpen: () => void;
   onDelete: () => void;
+  openLabel: string;
   deleteLabel: string;
+  readingLabel: string;
+  unreadLabel: string;
 }) {
   const entry: FileEntry =
     doc.kind === 'file'
       ? { name: doc.title, path: doc.id, kind: 'file', size: doc.size, mtime: doc.created * 1000, mime: doc.mime, viewer: viewerFor(doc.mime) }
       : { name: doc.title, path: doc.id, kind: 'file', size: doc.size, mtime: doc.created * 1000, mime: 'text/markdown', viewer: 'markdown' };
+  // A right-click menu with just the row's purposeful actions (Rechtsklick-Menüs, Minimalism):
+  // open the document in the viewer, or delete it — the same two actions the row already offers by
+  // double-click and its trash button, now reachable where a right-click expects them. The row is a
+  // Box (not a Stack) so the SDK ContextMenu can compose its ref onto a single forwarding child.
   return (
-    <Stack
-      role="option"
-      aria-selected={selected}
-      direction="row"
-      align="center"
-      justify="between"
-      gap={2}
-      onClick={onSelect}
-      onDoubleClick={onOpen}
-      className={cn('px-2 py-1.5 rounded-md cursor-pointer', selected ? 'bg-accent/15 text-text-primary' : 'hover:bg-fill/10')}
+    <ContextMenu
+      items={[
+        { id: 'open', label: openLabel, icon: <FileEntryIcon entry={entry} />, onSelect: onOpen },
+        { id: 'delete', label: deleteLabel, icon: <TrashIcon />, danger: true, separatorBefore: true, onSelect: onDelete },
+      ]}
     >
-      <Stack direction="row" align="center" gap={2} className="min-w-0">
-        <FileEntryIcon entry={entry} className="h-4 w-4 shrink-0" />
-        <Stack gap={0} className="min-w-0">
-          <Text truncate weight={selected ? 'semibold' : 'normal'}>
-            {doc.title}
-          </Text>
-          {doc.description && (
-            <Text variant="caption" color="tertiary" truncate>
-              {doc.description}
-            </Text>
-          )}
-        </Stack>
-      </Stack>
-      <IconButton
-        label={deleteLabel}
-        size="sm"
-        variant="ghost"
-        onClick={(e) => {
-          e.stopPropagation();
-          onDelete();
-        }}
+      <Box
+        role="option"
+        aria-selected={selected}
+        onClick={onSelect}
+        onDoubleClick={onOpen}
+        className={cn(
+          'flex flex-row items-center justify-between gap-2 px-2 py-1.5 rounded-md cursor-pointer',
+          selected ? 'bg-accent/15 text-text-primary' : 'hover:bg-fill/10',
+        )}
       >
-        <TrashIcon />
-      </IconButton>
-    </Stack>
+        <Stack direction="row" align="center" gap={2} className="min-w-0">
+          <FileEntryIcon entry={entry} className="h-4 w-4 shrink-0" />
+          <Stack gap={0} className="min-w-0">
+            <Text truncate weight={selected ? 'semibold' : 'normal'}>
+              {doc.title}
+            </Text>
+            {doc.description && (
+              <Text variant="caption" color="tertiary" truncate>
+                {doc.description}
+              </Text>
+            )}
+          </Stack>
+        </Stack>
+        <Stack direction="row" align="center" gap={2} className="shrink-0">
+          {/* At-a-glance read state for a file: a file being read, or one whose read failed, shows a
+              badge; a successfully read file needs no attention and shows none (Intuitiv by Design). */}
+          {doc.kind === 'file' && doc.extractState === 'pending' && <Badge variant="neutral">{readingLabel}</Badge>}
+          {doc.kind === 'file' && doc.extractState === 'failed' && <Badge variant="danger">{unreadLabel}</Badge>}
+          <IconButton
+            label={deleteLabel}
+            size="sm"
+            variant="ghost"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete();
+            }}
+          >
+            <TrashIcon />
+          </IconButton>
+        </Stack>
+      </Box>
+    </ContextMenu>
+  );
+}
+
+// The extraction section of a file's detail panel: it shows the ONE named read state and lets the user
+// act on it. Reading shows a quiet "reading…" note (the state ENDS — the list polls and this resolves);
+// a failed read shows why and offers "Read again" (retry from the stored bytes, no re-upload); a
+// finished read names its source (exact text layer, or recognized by a model) and can reveal the text
+// the assistant will actually draw on. A file with no read yet (uploaded before this feature) offers to
+// read it now.
+function ExtractSection({
+  api,
+  ui,
+  doc,
+  t,
+  onChanged,
+}: {
+  api: ServiceApiClient;
+  ui: ServiceContextProps['ui'];
+  doc: Document;
+  t: ReturnType<typeof useT>;
+  onChanged: () => void;
+}) {
+  const [showing, setShowing] = useState(false);
+  const [text, setText] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const state = doc.extractState ?? '';
+
+  // Reset the revealed text when the selected document changes, so it never shows a stale extract.
+  useEffect(() => {
+    setShowing(false);
+    setText(null);
+  }, [doc.id]);
+
+  async function toggle() {
+    if (showing) {
+      setShowing(false);
+      return;
+    }
+    setShowing(true);
+    if (text === null) {
+      setLoading(true);
+      try {
+        const r = await api.get<ExtractResponse>(`docs/${doc.id}/extract`);
+        setText(r.text ?? '');
+      } catch {
+        setText('');
+        ui.toast({ title: t('presentr.extractLoadFailed'), variant: 'error' });
+      } finally {
+        setLoading(false);
+      }
+    }
+  }
+
+  async function retry() {
+    setRetrying(true);
+    try {
+      await api.post(`docs/${doc.id}/extract`, {});
+      setText(null);
+      setShowing(false);
+      onChanged();
+    } catch (e) {
+      ui.toast({ title: t('presentr.extractRetryFailed'), description: (e as Error).message, variant: 'error' });
+    } finally {
+      setRetrying(false);
+    }
+  }
+
+  if (state === 'pending') {
+    return (
+      <Stack gap={1} align="start">
+        <Badge variant="neutral">{t('presentr.extractReading')}</Badge>
+        <Text variant="caption" color="tertiary">
+          {t('presentr.extractPendingBody')}
+        </Text>
+      </Stack>
+    );
+  }
+
+  if (state === 'failed') {
+    return (
+      <Stack gap={2} align="start">
+        <Text color="secondary">{t('presentr.extractFailedBody', { reason: doc.extractError ?? '' })}</Text>
+        <Button variant="secondary" loading={retrying} onClick={retry}>
+          {t('presentr.extractRetry')}
+        </Button>
+      </Stack>
+    );
+  }
+
+  if (state === 'ready') {
+    const source =
+      doc.extractSource === 'ai'
+        ? t('presentr.extractFromAI', { model: doc.extractModel || doc.extractEngine || 'the assistant' })
+        : t('presentr.extractFromLayer');
+    return (
+      <Stack gap={2} align="start" className="w-full">
+        <Text weight="semibold">{t('presentr.extractReadHeading')}</Text>
+        <Text variant="caption" color="tertiary">
+          {source}
+        </Text>
+        <Button variant="ghost" size="sm" onClick={toggle} loading={loading}>
+          {showing ? t('presentr.extractHide') : t('presentr.extractShow')}
+        </Button>
+        {showing && !loading && (
+          <Box className="max-h-72 w-full overflow-auto rounded-md bg-fill/5 p-3">
+            <Text variant="footnote" color="secondary" className="whitespace-pre-wrap">
+              {text ? text : t('presentr.extractEmpty')}
+            </Text>
+          </Box>
+        )}
+      </Stack>
+    );
+  }
+
+  // No read yet (a file uploaded before this feature): offer to read it now.
+  return (
+    <Button variant="secondary" loading={retrying} onClick={retry}>
+      {t('presentr.extractRetry')}
+    </Button>
   );
 }
 

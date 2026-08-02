@@ -325,3 +325,82 @@ func TestDeleteFileRemovesBytes(t *testing.T) {
 		t.Fatal("metadata still present after Delete")
 	}
 }
+
+// The extract rides WITH the document (no second store): SetExtract stamps the small state fields onto
+// the metadata and keeps the text out of band, ExtractText reads it back, and both survive a reopen.
+// List stays metadata-only — the extract text is never carried inline.
+func TestSetAndGetExtract(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data", "docs.json")
+	p, err := OpenDocs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := addFile(t, p, "f1", "plate.png", "image/png", []byte{0x89, 'P', 'N', 'G'})
+	if err := p.SetExtract(d.ID, Extract{State: "ready", Text: "SN 12345", Source: "ai", Model: "claude", At: 42}); err != nil {
+		t.Fatalf("SetExtract: %v", err)
+	}
+	got, _ := p.Get(d.ID)
+	if got.ExtractState != "ready" || got.ExtractSource != "ai" || got.ExtractModel != "claude" || got.ExtractSize != int64(len("SN 12345")) {
+		t.Fatalf("extract metadata not stamped: %+v", got)
+	}
+	if text, ok := p.ExtractText(d.ID); !ok || text != "SN 12345" {
+		t.Fatalf("ExtractText = %q, %v", text, ok)
+	}
+	// The metadata list must not carry the extract text inline (Portionierte Daten).
+	for _, ld := range p.List() {
+		if ld.ID == d.ID && ld.Content != "" {
+			t.Fatal("List leaked extract/file content into the metadata")
+		}
+	}
+
+	// Survives a reopen from disk.
+	p2, err := OpenDocs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := p2.Get(d.ID); got.ExtractState != "ready" {
+		t.Fatalf("extract state lost on reopen: %+v", got)
+	}
+	if text, ok := p2.ExtractText(d.ID); !ok || text != "SN 12345" {
+		t.Fatalf("extract text lost on reopen: %q %v", text, ok)
+	}
+}
+
+// A failed read records the reason, an unknown id is a no-op, and Delete removes the extract text too.
+func TestExtractFailedAndDelete(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	p, err := OpenDocs(filepath.Join(dir, "docs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := addFile(t, p, "f1", "scan.pdf", "application/pdf", []byte("%PDF-1.7"))
+	if err := p.SetExtract(d.ID, Extract{State: "failed", Error: "no AI", At: 7}); err != nil {
+		t.Fatalf("SetExtract failed: %v", err)
+	}
+	if got, _ := p.Get(d.ID); got.ExtractState != "failed" || got.ExtractError != "no AI" {
+		t.Fatalf("failed read not recorded: %+v", got)
+	}
+	// An extract for a document that no longer exists is discarded, not an error.
+	if err := p.SetExtract("gone", Extract{State: "ready", Text: "x"}); err != nil {
+		t.Fatalf("SetExtract on a missing id must be a no-op: %v", err)
+	}
+
+	// A ready extract's text file is dropped on Delete.
+	if err := p.SetExtract(d.ID, Extract{State: "ready", Text: "layer text"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p.ExtractText(d.ID); !ok {
+		t.Fatal("extract text should be present before delete")
+	}
+	if err := p.Delete(d.ID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, ok := p.ExtractText(d.ID); ok {
+		t.Fatal("extract text still present after Delete")
+	}
+	if entries, err := os.ReadDir(filepath.Join(dir, "extracts")); err == nil {
+		if len(entries) != 0 {
+			t.Fatalf("extracts dir not cleaned after delete: %d entries", len(entries))
+		}
+	}
+}
