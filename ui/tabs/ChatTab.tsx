@@ -27,7 +27,7 @@ import {
   type ServiceContextProps,
 } from '@holistic/ui';
 import type { ChatHistory, ChatMessage, DocsResponse } from '../types';
-import { askRoom } from '../roomAI';
+import { askRoom, askStepLabel, describeAskError } from '../roomAI';
 
 // The room assistant — the heart of presentr. The user asks questions and the assistant answers as
 // an explainer, grounded in the document pool (text AND uploaded PDFs/images). Per the holistic
@@ -52,6 +52,7 @@ export function ChatTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
   const [messages, setMessages] = useState<ChatMessage[] | null>(null); // null while loading
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+  const [step, setStep] = useState<string | null>(null); // the granular progress of the running turn
   const scrollRef = useRef<HTMLElement>(null);
 
   // Load the persisted conversation once (Zustandserhalt: same session after a browser reload).
@@ -86,8 +87,8 @@ export function ChatTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
       const transcript = convo.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`).join('\n\n');
       const prompt = `${PREAMBLE}\n\n${docs.length === 0 ? NO_DOCS_NOTE + '\n\n' : ''}${transcript}\n\nAssistant:`;
       // The backend grounds the turn in the whole pool (text AND uploaded files) — the UI sends only
-      // the prompt and the requested shape.
-      const result = await askRoom(api, { prompt, outputFormat: 'markdown' });
+      // the prompt and the requested shape, and shows each step the background turn reports.
+      const result = await askRoom(api, { prompt, outputFormat: 'markdown' }, (p) => setStep(askStepLabel(t, p)));
       const answer: ChatMessage = {
         role: 'assistant',
         text: (result.output || '').trim() || t('presentr.chatEmpty'),
@@ -99,9 +100,10 @@ export function ChatTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
       setMessages(next);
       void api.put('chats', { messages: next }).catch(() => {});
     } catch (e) {
-      ui.toast({ title: t('presentr.chatFailed'), description: (e as Error).message, variant: 'error' });
+      ui.toast({ title: t('presentr.chatFailed'), description: describeAskError(t, e), variant: 'error' });
     } finally {
       setSending(false);
+      setStep(null);
     }
   }
 
@@ -152,7 +154,7 @@ export function ChatTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
                 <Stack direction="row" align="center" gap={2}>
                   <Spinner />
                   <Text variant="footnote" color="secondary">
-                    {t('presentr.chatThinking')}
+                    {step ?? t('presentr.chatThinking')}
                   </Text>
                 </Stack>
               )}

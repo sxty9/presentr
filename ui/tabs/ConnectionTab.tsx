@@ -27,7 +27,7 @@ import type {
   DiagramView,
   DocsResponse,
 } from '../types';
-import { askRoom } from '../roomAI';
+import { askRoom, askStepLabel, describeAskError } from '../roomAI';
 import {
   EXTRACT_PROMPT,
   NODE_H,
@@ -56,6 +56,7 @@ export function ConnectionTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui
   const t = useT();
   const [view, setView] = useState<DiagramView | null>(null); // null while loading
   const [busy, setBusy] = useState(false);
+  const [step, setStep] = useState<string | null>(null); // the granular progress of a running generation
   const [pending, setPending] = useState<{ node: string; port: string } | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [name, setName] = useState('');
@@ -92,7 +93,7 @@ export function ConnectionTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui
       const v = await api.put<DiagramView>('diagram', { nodes: next.nodes, edges: next.edges });
       setView(v);
     } catch (e) {
-      ui.toast({ title: t('presentr.diagramSaveFailed'), description: (e as Error).message, variant: 'error' });
+      ui.toast({ title: t('presentr.diagramSaveFailed'), description: describeAskError(t, e), variant: 'error' });
     }
   }
 
@@ -176,8 +177,9 @@ export function ConnectionTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui
         ui.toast({ title: t('presentr.diagramNeedDocs'), variant: 'info' });
         return;
       }
-      // The backend grounds the extraction in the whole pool (including uploaded PDFs/images).
-      const result = await askRoom(api, { prompt: EXTRACT_PROMPT, outputFormat: 'json' });
+      // The backend grounds the extraction in the whole pool (including uploaded PDFs/images), and
+      // reports each step of the background turn so the button shows progress, not just a spinner.
+      const result = await askRoom(api, { prompt: EXTRACT_PROMPT, outputFormat: 'json' }, (p) => setStep(askStepLabel(t, p)));
       const g = parseGraph(result.output ?? '');
       if (!g || g.nodes.length === 0) {
         ui.toast({ title: t('presentr.diagramNoResult'), variant: 'info' });
@@ -190,9 +192,10 @@ export function ConnectionTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui
       });
       setView(v);
     } catch (e) {
-      ui.toast({ title: t('presentr.diagramGenFailed'), description: (e as Error).message, variant: 'error' });
+      ui.toast({ title: t('presentr.diagramGenFailed'), description: describeAskError(t, e), variant: 'error' });
     } finally {
       setBusy(false);
+      setStep(null);
     }
   }
 
@@ -200,7 +203,7 @@ export function ConnectionTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui
     try {
       setView(await api.post<DiagramView>('diagram/restore', {}));
     } catch (e) {
-      ui.toast({ title: t('presentr.diagramRestoreFailed'), description: (e as Error).message, variant: 'error' });
+      ui.toast({ title: t('presentr.diagramRestoreFailed'), description: describeAskError(t, e), variant: 'error' });
     }
   }
 
@@ -241,6 +244,12 @@ export function ConnectionTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui
           </Button>
         </Stack>
       </Stack>
+
+      {busy && step && (
+        <Text variant="footnote" color="secondary">
+          {step}
+        </Text>
+      )}
 
       <Panel className="p-0 overflow-auto" style={{ maxHeight: '60vh' }}>
         <Box className="relative select-none" style={{ width: size.w, height: size.h }} onPointerDown={() => setPending(null)}>

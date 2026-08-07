@@ -41,10 +41,17 @@ var ErrNoVisionEngine = errors.New("aigentic: no vision-capable engine for an im
 // InlineFile is one grounding part handed to aigentic without any server fs access: text carries its
 // content directly; an image or PDF carries base64 bytes plus its media type (mirrors
 // aigentic.InlineFile — the contract, never imported).
+//
+// Ref is the put-once/reference-many path: after aigentic reads a part's bytes once, it keeps them in
+// its graveyard and returns a reference (Res.Context[].Ref). A later turn that would re-send the SAME
+// bytes sends ONLY that Ref (with Content empty), so a large document/image is put ONCE and referenced
+// on every following question instead of shipping its full bytes each time. A part with a Ref set and
+// empty Content resolves server-side to the already-held bytes; a fresh part (no Ref) carries Content.
 type InlineFile struct {
 	Path      string `json:"path"`
 	Content   string `json:"content"`
 	MediaType string `json:"mediaType,omitempty"`
+	Ref       string `json:"ref,omitempty"`
 }
 
 // Req is the subset of aigentic's request presentr sets: the prompt, the requested answer shape, an
@@ -57,10 +64,21 @@ type Req struct {
 }
 
 // Res is the subset of aigentic's result presentr renders and labels (Kennzeichnungspflicht).
+// Context carries, per grounding part aigentic read, the reference to the bytes it now holds — the
+// put-once/reference-many return path (see InlineFile.Ref). presentr remembers each Ref against the
+// document/image it came from so the next turn references the bytes instead of re-sending them.
 type Res struct {
-	Output string
-	Engine string
-	Model  string
+	Output  string
+	Engine  string
+	Model   string
+	Context []ContextRef
+}
+
+// ContextRef pairs a grounding part's Path (the same path presentr sent) with the reference aigentic
+// returned for the bytes it kept. An empty Ref means aigentic held nothing referenceable for that part.
+type ContextRef struct {
+	Path string
+	Ref  string
 }
 
 // Client posts to aigentic's internal/run endpoint with the shared internal secret.
@@ -217,15 +235,25 @@ func (c *Client) dispatch(ctx context.Context, subject, kind string, data wireDa
 
 	var out struct {
 		Data struct {
-			Output string `json:"output"`
-			Engine string `json:"engine"`
-			Model  string `json:"model"`
+			Output  string `json:"output"`
+			Engine  string `json:"engine"`
+			Model   string `json:"model"`
+			Context []struct {
+				Path string `json:"path"`
+				Ref  string `json:"ref"`
+			} `json:"context"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return Res{}, fmt.Errorf("aigentic: bad response: %w", err)
 	}
-	return Res{Output: out.Data.Output, Engine: out.Data.Engine, Model: out.Data.Model}, nil
+	res := Res{Output: out.Data.Output, Engine: out.Data.Engine, Model: out.Data.Model}
+	for _, c := range out.Data.Context {
+		if c.Ref != "" {
+			res.Context = append(res.Context, ContextRef{Path: c.Path, Ref: c.Ref})
+		}
+	}
+	return res, nil
 }
 
 // detailOf pulls the {"detail": …} message out of an aigentic error body, falling back to the raw

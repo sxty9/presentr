@@ -181,7 +181,7 @@ func TestRunExtractionPersistsCompressedImages(t *testing.T) {
 		t.Fatalf("the persisted image must be JPEG bytes")
 	}
 	// And that image is then part of the grounding as its own image/jpeg part (not only its text).
-	parts, _ := s.roomGrounding("")
+	parts, _, _ := s.roomGrounding("")
 	var haveImage bool
 	for _, p := range parts {
 		if p.MediaType == "image/jpeg" {

@@ -28,8 +28,10 @@ func newServer(t *testing.T) *Server {
 	// The upload/raw handlers reach only the document pool; the verifier, aigentic client and the
 	// other pools are exercised through the guard, which these tests call the handlers beneath.
 	s := New(nil, docs, nil, nil, nil)
-	// An upload launches a background text read; drain those before the temp dir is torn down, so a
-	// read never races the cleanup (t.Cleanup runs LIFO — this runs before t.TempDir's own removal).
+	// An upload launches a background text read, and an ask starts a background AI turn; drain both before
+	// the temp dir is torn down, so neither races the cleanup (t.Cleanup runs LIFO — these run before
+	// t.TempDir's own removal).
+	t.Cleanup(s.WaitAsk)
 	t.Cleanup(s.WaitExtractions)
 	return s
 }

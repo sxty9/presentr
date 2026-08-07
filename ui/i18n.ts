@@ -124,5 +124,15 @@ registerMessages({
     'presentr.chatClear': 'Clear',
     'presentr.chatClearTitle': 'Clear conversation',
     'presentr.chatClearConfirm': 'Delete this conversation? This cannot be undone.',
+
+    // Room-AI progress — the granular steps shown while a turn runs (it runs as a background job, polled
+    // for progress, so the wait shows what is happening rather than a bare spinner).
+    'presentr.askStepGrounding': 'Gathering the room context…',
+    'presentr.askStepSending': 'Room context ready ({docs} documents, {images} images) — asking the assistant…',
+    'presentr.askStepReceived': 'Answer received',
+
+    // Shown instead of a raw proxy/timeout page when the server does not answer a room-AI turn in time.
+    'presentr.serverTimeout': 'The server did not respond in time — please try again.',
+    'presentr.serverError': 'Something went wrong — please try again.',
   },
 });

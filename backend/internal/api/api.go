@@ -64,6 +64,23 @@ type Server struct {
 	// is used). It is the boundary presentr ASKS aigentic for rather than guessing (RefreshRequestLimit),
 	// and it sizes the sections a large file is split into. A test may set it to force small sections.
 	aiLimit atomic.Int64
+
+	// askMu guards the in-memory registry of background ask jobs. An /ask turn no longer runs inside its
+	// HTTP request (a grounded turn over a large pool can outlast Cloudflare's ~100s edge limit and land
+	// a 524 in the browser); it runs as a background job the UI polls for granular progress. Jobs are
+	// transient — a browser that reloads simply asks again — so they live in memory, not the pool.
+	askMu   sync.Mutex
+	askJobs map[string]*askJob
+	// askWG tracks in-flight ask jobs so a test (or a graceful stop) can drain them deterministically.
+	askWG sync.WaitGroup
+
+	// refMu guards refs: the put-once/reference-many cache. After aigentic reads a document/image once it
+	// returns a reference to the bytes it now holds; presentr remembers it here (keyed by the document/
+	// image) so the NEXT turn sends only the reference, not the full bytes again. Held in memory only: a
+	// reference must never outlive the bytes aigentic holds, so a restart re-sends bytes rather than
+	// trusting a possibly-evicted reference. Invalidated when a document is deleted or re-read.
+	refMu sync.Mutex
+	refs  map[string]string
 }
 
 // maxConcurrentExtractions caps parallel background reads (see extractSem).
@@ -79,6 +96,8 @@ func New(v *auth.Verifier, docs store.DocStore, chats *store.ChatPool, diagram *
 	return &Server{
 		v: v, docs: docs, chats: chats, diagram: diagram, ai: ai,
 		extractSem: make(chan struct{}, maxConcurrentExtractions),
+		askJobs:    map[string]*askJob{},
+		refs:       map[string]string{},
 	}
 }
 
@@ -118,6 +137,9 @@ func (s *Server) Handler() http.Handler {
 	// pool (text AND uploaded files) and forwards it to aigentic on the caller's behalf. Both the
 	// Chat tab and the Connection diagram derive from it. Right-gated + CSRF (it spends AI budget).
 	mux.HandleFunc("POST "+base+"ask", s.guard(rights.GroupUse, true, s.ask))
+	// Poll one background ask job for granular progress and, once done, its answer. Read-only (no
+	// CSRF); scoped to the caller who started it.
+	mux.HandleFunc("GET "+base+"ask/{id}", s.guard(rights.GroupUse, false, s.askStatus))
 
 	// The connection diagram (workflow stage 2). GET reads the current graph + whether it is the
 	// document-derived state or manually modified. PUT replaces the current graph (a manual edit).
@@ -241,10 +263,14 @@ func (s *Server) addDoc(w http.ResponseWriter, r *http.Request, u *auth.User) {
 // deleteDoc removes a document from the room pool. Idempotent: deleting a missing id still
 // reports success, so the UI converges on the same state either way.
 func (s *Server) deleteDoc(w http.ResponseWriter, r *http.Request, _ *auth.User) {
-	if err := s.docs.Delete(r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	if err := s.docs.Delete(id); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not delete the document")
 		return
 	}
+	// The bytes aigentic held for this document are gone; drop any remembered references so a later turn
+	// re-sends fresh content rather than pointing at a deleted document (put-once invalidation).
+	s.invalidateRefs(id)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

@@ -11,8 +11,40 @@ import (
 	"testing"
 
 	"presentr/internal/aigentic"
+	"presentr/internal/auth"
 	"presentr/internal/store"
 )
+
+// runAskJob drives one ask through its whole async lifecycle: start the background job, drain it, then
+// read the finished job's status. It returns the decoded status body so a test asserts on the answer and
+// the granular progress fields the UI polls.
+func runAskJob(t *testing.T, s *Server, u *auth.User, promptBody string) map[string]any {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	s.ask(rec, httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(promptBody)), u)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("ask start = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	var start struct {
+		JobID string `json:"jobId"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &start); err != nil || start.JobID == "" {
+		t.Fatalf("ask start body = %s (err %v)", rec.Body.String(), err)
+	}
+	s.WaitAsk()
+	sr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.SetPathValue("id", start.JobID)
+	s.askStatus(sr, req, u)
+	if sr.Code != http.StatusOK {
+		t.Fatalf("ask status = %d, want 200: %s", sr.Code, sr.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(sr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("ask status body = %s (err %v)", sr.Body.String(), err)
+	}
+	return out
+}
 
 // roomGrounding turns the whole pool into inline parts: text documents as inline markdown, text
 // files inline, and images/PDFs base64-encoded with their media type.
@@ -27,7 +59,7 @@ func TestRoomGrounding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	parts, gaps := s.roomGrounding("")
+	parts, gaps, _ := s.roomGrounding("")
 	if len(parts) != 3 {
 		t.Fatalf("grounding has %d parts, want 3: %+v", len(parts), parts)
 	}
@@ -60,7 +92,7 @@ func TestRoomGroundingNamesOmittedDocuments(t *testing.T) {
 	big := strings.Repeat("x", maxGroundingBytes+1)
 	_ = s.docs.Add(store.Document{ID: store.NewID(), Title: "Huge manual", Kind: "text", Mime: "text/markdown", Content: big})
 
-	parts, gaps := s.roomGrounding("")
+	parts, gaps, _ := s.roomGrounding("")
 	if len(parts) != 1 || parts[0].Path != "Fits" {
 		t.Fatalf("grounding should carry only the fitting document, got %+v", parts)
 	}
@@ -94,7 +126,7 @@ func TestRoomGroundingUsesExtractAndNamesUnreadFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	parts, gaps := s.roomGrounding("")
+	parts, gaps, _ := s.roomGrounding("")
 	if len(parts) != 1 {
 		t.Fatalf("only the ready file should be grounded, got %d parts: %+v", len(parts), parts)
 	}
@@ -153,15 +185,11 @@ func TestAskForwardsToAigentic(t *testing.T) {
 	s.ai = aigentic.New(stub.URL, "sekret")
 	_ = s.docs.Add(store.Document{ID: store.NewID(), Title: "Notes", Kind: "text", Mime: "text/markdown", Content: "# Room"})
 
-	rec := httptest.NewRecorder()
-	s.ask(rec, httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(`{"prompt":"how do I connect?","outputFormat":"markdown"}`)), user())
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("ask status %d, body %s", rec.Code, rec.Body.String())
+	out := runAskJob(t, s, user(), `{"prompt":"how do I connect?","outputFormat":"markdown"}`)
+	if out["state"] != "done" {
+		t.Fatalf("ask job did not finish: %+v", out)
 	}
-	var out struct{ Output, Engine, Model string }
-	_ = json.Unmarshal(rec.Body.Bytes(), &out)
-	if out.Output != "the answer" || out.Engine != "ollama" || out.Model != "llama3" {
+	if out["output"] != "the answer" || out["engine"] != "ollama" || out["model"] != "llama3" {
 		t.Fatalf("ask result = %+v", out)
 	}
 	if gotSecret != "sekret" || gotSubject != "ada" || gotKind != "choose" {
@@ -188,7 +216,7 @@ func TestRoomGroundingIncludesReadImages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	parts, gaps := s.roomGrounding("")
+	parts, gaps, _ := s.roomGrounding("")
 	if len(gaps.omittedImages) != 0 {
 		t.Fatalf("a small image must fit, got omitted %+v", gaps.omittedImages)
 	}
@@ -229,7 +257,7 @@ func TestRoomGroundingNamesOmittedImage(t *testing.T) {
 	if err := s.docs.SetExtractImages("man", []store.ExtractImage{{Index: 0, Page: 1, Data: huge}}); err != nil {
 		t.Fatal(err)
 	}
-	parts, gaps := s.roomGrounding("")
+	parts, gaps, _ := s.roomGrounding("")
 	for _, p := range parts {
 		if p.MediaType == "image/jpeg" {
 			t.Fatalf("an over-budget image must not be sent")
@@ -281,21 +309,90 @@ func TestAskRetriesTextOnlyWhenNoVisionEngine(t *testing.T) {
 	_ = s.docs.SetExtract("man", store.Extract{State: "ready", Text: "nameplate text", Source: "mixed"})
 	_ = s.docs.SetExtractImages("man", []store.ExtractImage{{Index: 0, Page: 1, Data: []byte("jpegbytes")}})
 
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(`{"prompt":"what model is the projector?"}`))
-	s.ask(rec, req, user())
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("ask must fall back to a text-only answer, got %d: %s", rec.Code, rec.Body.String())
+	out := runAskJob(t, s, user(), `{"prompt":"what model is the projector?"}`)
+	if out["state"] != "done" {
+		t.Fatalf("ask must fall back to a text-only answer, got %+v", out)
 	}
 	if len(sawImage) != 2 || !sawImage[0] || sawImage[1] {
 		t.Fatalf("expected an image turn then a text-only retry, got %v", sawImage)
 	}
-	var out struct {
-		Output string `json:"output"`
+	if out["output"] != "answer from text" {
+		t.Fatalf("the text-only retry's answer must be returned: %+v", out)
 	}
-	_ = json.Unmarshal(rec.Body.Bytes(), &out)
-	if out.Output != "answer from text" {
-		t.Fatalf("the text-only retry's answer must be returned: %q", out.Output)
+}
+
+// Put-once/reference-many: after aigentic reads a document once and returns a reference to the bytes it
+// kept, the NEXT turn sends ONLY that reference (empty content) instead of the full bytes again — the fix
+// for a large document re-shipping on every question. Deleting the document forgets the reference, so a
+// later turn re-sends fresh content rather than pointing at gone bytes.
+func TestAskPutOnceReferencesKeptBytes(t *testing.T) {
+	var lastInline []aigentic.InlineFile
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Data json.RawMessage `json:"data"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		var data struct {
+			Inline []aigentic.InlineFile `json:"inline"`
+		}
+		_ = json.Unmarshal(body.Data, &data)
+		lastInline = data.Inline
+		// Return a reference for the "Notes" grounding part, mirroring aigentic's put-once return path.
+		io.WriteString(w, `{"data":{"output":"ok","engine":"e","model":"m","context":[{"path":"Notes","ref":"grave-1"}]}}`)
+	}))
+	defer stub.Close()
+
+	s := newServer(t)
+	s.ai = aigentic.New(stub.URL, "sekret")
+	_ = s.docs.Add(store.Document{ID: "n1", Title: "Notes", Kind: "text", Mime: "text/markdown", Content: "# Room notes"})
+
+	// First turn: no reference known yet, so the document goes out with full content.
+	_ = runAskJob(t, s, user(), `{"prompt":"q1"}`)
+	if len(lastInline) != 1 || lastInline[0].Content == "" || lastInline[0].Ref != "" {
+		t.Fatalf("the first turn must send full content, got %+v", lastInline)
+	}
+
+	// Second turn: the remembered reference is sent instead of the bytes.
+	_ = runAskJob(t, s, user(), `{"prompt":"q2"}`)
+	if len(lastInline) != 1 || lastInline[0].Ref != "grave-1" || lastInline[0].Content != "" {
+		t.Fatalf("the second turn must reference the kept bytes, got %+v", lastInline)
+	}
+
+	// Deleting the document forgets its reference (invalidation).
+	if _, ok := s.refFor(textRefKey("n1")); !ok {
+		t.Fatalf("a reference should be cached after a successful turn")
+	}
+	dr := httptest.NewRequest(http.MethodDelete, "/x", nil)
+	dr.SetPathValue("id", "n1")
+	s.deleteDoc(httptest.NewRecorder(), dr, user())
+	if _, ok := s.refFor(textRefKey("n1")); ok {
+		t.Fatalf("deleting the document must forget its reference")
+	}
+}
+
+// A background ask job is scoped to the user who started it: another user with the right cannot poll it.
+func TestAskStatusIsOwnerScoped(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"data":{"output":"ok","engine":"e","model":"m"}}`)
+	}))
+	defer stub.Close()
+	s := newServer(t)
+	s.ai = aigentic.New(stub.URL, "sekret")
+
+	rec := httptest.NewRecorder()
+	s.ask(rec, httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(`{"prompt":"q"}`)), user())
+	var start struct {
+		JobID string `json:"jobId"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &start)
+	s.WaitAsk()
+
+	other := &auth.User{Username: "bob", Groups: []string{"hp_presentr_use"}}
+	sr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.SetPathValue("id", start.JobID)
+	s.askStatus(sr, req, other)
+	if sr.Code != http.StatusNotFound {
+		t.Fatalf("another user must not read the job, got %d", sr.Code)
 	}
 }
