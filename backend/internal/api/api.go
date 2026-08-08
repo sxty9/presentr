@@ -43,6 +43,7 @@ const (
 	maxIDLen   = 64    // clamp a client-supplied id
 	maxKeyLen  = 128   // clamp the source fingerprint
 	maxCoord   = 20000 // clamp a canvas coordinate
+	maxNoteLen = 2000  // clamp the assistant's generation note (why nothing was concluded / a failure)
 )
 
 // Server wires the session verifier and presentr's passive pools into HTTP handlers. The document
@@ -343,6 +344,15 @@ func diagramView(st store.DiagramSnapshot) map[string]any {
 		"modified":  st.Modified,
 		"sourceKey": st.SourceKey,
 		"generated": st.Generated,
+		// The last generate attempt's outcome, so the UI can show a STANDING banner (persistent, not a
+		// vanishing toast) — including the assistant's own reason when it concluded no connections.
+		"generation": map[string]any{
+			"state":  st.Generation.State,
+			"note":   st.Generation.Note,
+			"model":  st.Generation.Model,
+			"engine": st.Generation.Engine,
+			"at":     st.Generation.At,
+		},
 	}
 }
 
@@ -371,30 +381,67 @@ func (s *Server) putDiagram(w http.ResponseWriter, r *http.Request, _ *auth.User
 	writeJSON(w, http.StatusOK, diagramView(s.diagram.Get()))
 }
 
-// generateDiagram installs a freshly derived baseline. The UI runs the aigentic investigation of the
-// documents (the "Ask AI" standard, session-forwarded) and posts the resulting graph plus a
-// fingerprint of the documents it came from. The baseline (Doc) is always replaced; the visible
-// graph (Current) is replaced too, but only while the user has NOT manually modified it — so a
-// hand-drawn layout is never overwritten behind the user's back (it stays reachable via restore).
+// generateDiagram records the OUTCOME of a "generate from documents" attempt. The UI runs the aigentic
+// investigation of the documents (the "Ask AI" standard, session-forwarded) and reports one of three
+// outcomes here, so the result is stored on the shared diagram and PERSISTS across reloads (not a
+// vanishing toast):
+//
+//   - "ok": a graph was derived. The baseline (Doc) is replaced; the visible graph (Current) is replaced
+//     too, but only while the user has NOT manually modified it — so a hand-drawn layout is never
+//     overwritten behind the user's back (it stays reachable via restore). The generation is stamped ok
+//     with the model that produced it (Kennzeichnungspflicht).
+//   - "empty": the assistant concluded NO connections. The graph is left untouched (a prior diagram is
+//     not wiped by a fruitless attempt); the assistant's own explanation is stored as the note, so the
+//     user is told WHY rather than left with a silent, endless spinner (Kein stummes Ausbleiben).
+//   - "failed": the turn could not complete (timeout, no engine). The graph is left untouched; the reason
+//     is stored as the note.
 func (s *Server) generateDiagram(w http.ResponseWriter, r *http.Request, _ *auth.User) {
 	var body struct {
+		State     string     `json:"state"`
 		Nodes     []jsonNode `json:"nodes"`
 		Edges     []jsonEdge `json:"edges"`
 		SourceKey string     `json:"sourceKey"`
+		Note      string     `json:"note"`
+		Model     string     `json:"model"`
+		Engine    string     `json:"engine"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxDiagramBody)).Decode(&body); err != nil && err != io.EOF {
 		writeErr(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 	g := sanitizeGraph(body.Nodes, body.Edges)
+	// The outcome is derived here, not trusted verbatim: "ok" requires an actual graph, so a client that
+	// mislabels an empty result as ok still records honestly (the pool/api layer owns every judgement).
+	state := strings.TrimSpace(body.State)
+	if state == "" {
+		state = "ok" // backward-compatible default for a caller that posts only a graph
+	}
+	if state == "ok" && len(g.Nodes) == 0 {
+		state = "empty"
+	}
+	gen := store.Generation{
+		Note:   clip(body.Note, maxNoteLen),
+		Model:  clip(body.Model, maxLabelLen),
+		Engine: clip(body.Engine, maxLabelLen),
+		At:     time.Now().Unix(),
+	}
 	key := clip(body.SourceKey, maxKeyLen)
 	err := s.diagram.Update(func(st *store.DiagramSnapshot) {
-		st.Doc = g
-		st.SourceKey = key
-		st.Generated = time.Now().Unix()
-		if !st.Modified {
-			st.Current = store.CloneGraph(g)
+		switch state {
+		case "ok":
+			st.Doc = g
+			st.SourceKey = key
+			st.Generated = time.Now().Unix()
+			if !st.Modified {
+				st.Current = store.CloneGraph(g)
+			}
+			gen.State = "ok"
+		case "failed":
+			gen.State = "failed"
+		default:
+			gen.State = "empty"
 		}
+		st.Generation = gen
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not save the diagram")

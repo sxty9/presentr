@@ -106,10 +106,23 @@ registerMessages({
     'presentr.devicePorts': 'Number of ports',
     'presentr.add': 'Add',
     'presentr.diagramNeedDocs': 'Add some documents first — the diagram is derived from them.',
-    'presentr.diagramNoResult': 'The assistant could not derive a diagram from the documents.',
     'presentr.diagramGenFailed': 'Could not generate the diagram',
     'presentr.diagramSaveFailed': 'Could not save the diagram',
     'presentr.diagramRestoreFailed': 'Could not restore the diagram',
+
+    // The standing outcome of the last "generate from documents" attempt (persistent, not a toast).
+    // "empty": the assistant concluded no connections — it shows its own reason, plus this fallback
+    // when it gave none. "failed": the turn could not finish. "ok": a caption names the model that
+    // produced the diagram (Kennzeichnungspflicht für KI-Modellantworten).
+    'presentr.genEmptyBadge': 'No result',
+    'presentr.genEmptyTitle': 'No connections could be concluded',
+    'presentr.genEmptyBody':
+      'The assistant found no wiring diagram or device list to derive connections from. Add the room’s wiring documents — a cabling diagram or a list of the devices — to the Docs tab, then generate again.',
+    'presentr.genByModel': 'Assessed by {model}',
+    'presentr.genFailedBadge': 'Failed',
+    'presentr.genFailedTitle': 'Generation did not finish',
+    'presentr.genFailedBody': 'The assistant could not finish deriving the diagram. Please try again.',
+    'presentr.genDerivedBy': 'Diagram derived by {model}',
 
     // Chat tab (the assistant — routed through aigentic)
     'presentr.chatHeading': 'Room assistant',
