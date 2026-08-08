@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"presentr/internal/auth"
@@ -129,6 +130,53 @@ func TestUploadAndRaw(t *testing.T) {
 	}
 	if !bytes.Equal(rrec.Body.Bytes(), pngSig) {
 		t.Fatalf("raw bytes mismatch: got %v", rrec.Body.Bytes())
+	}
+}
+
+// A single file well over the per-file limit is turned away with the NAMED reason (415 + detail),
+// not a torn stream. 41 MiB is deliberately larger than the former 40 MiB whole-batch cap that used
+// to abort the upload mid-stream before the friendly per-file check could run: the batch body cap
+// now follows from the per-file limit, so the file parses in full and the named rejection is reached.
+func TestUploadOversizedFileNamedRejection(t *testing.T) {
+	s := newServer(t)
+
+	// A PDF header followed by padding — the size check fires before classification, so the padding's
+	// type is irrelevant; what matters is that fh.Size exceeds maxFileBytes.
+	big := make([]byte, 41<<20)
+	copy(big, []byte("%PDF-1.7\n"))
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	w, _ := mw.CreateFormFile("files", "huge-manual.pdf")
+	w.Write(big)
+	mw.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/services/presentr/docs", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	s.uploadFiles(rec, req, user())
+
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("oversized-file status %d, want 415: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Detail   string `json:"detail"`
+		Rejected []struct {
+			Name, Reason string
+		} `json:"rejected"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Rejected) != 1 || out.Rejected[0].Name != "huge-manual.pdf" {
+		t.Fatalf("rejected = %+v, want exactly huge-manual.pdf", out.Rejected)
+	}
+	// The reason must name the limit — an honest rejection, never a bare failure.
+	if !strings.Contains(out.Rejected[0].Reason, "20 MB limit") {
+		t.Fatalf("rejection reason %q must name the 20 MB per-file limit", out.Rejected[0].Reason)
+	}
+	if !strings.Contains(out.Detail, "20 MB limit") {
+		t.Fatalf("detail %q must name the 20 MB per-file limit", out.Detail)
 	}
 }
 

@@ -38,6 +38,24 @@ import type { DocsResponse, Document, UploadResponse } from '../types';
 // service never renders media itself). Reads and writes go through the shared, authenticated api
 // client; the backend pool is passive and every write is atomic.
 
+// The per-file upload limit, mirroring backend/internal/api/files.go (maxFileBytes / maxUploadFiles).
+// The server stays the authority; these let the entry point NAME what it accepts and let the UI turn
+// an over-limit file away before a byte is sent — so an oversized file never becomes a stalled upload
+// the server has to abort mid-stream. Keep the two in sync (like USE_RIGHT mirrors the backend right).
+const MAX_FILE_MIB = 20;
+const MAX_FILE_BYTES = MAX_FILE_MIB * 1024 * 1024;
+// The file kinds the pool accepts (aigentic reads these). A picker hint only — drag/drop and paste
+// bypass it and the server re-checks every file by sniffing its bytes.
+const ACCEPT_HINT =
+  'image/png,image/jpeg,image/gif,image/webp,application/pdf,text/*,.md,.markdown,.csv,.json,.log,.yaml,.yml,.toml,.ini';
+
+// formatSize renders a byte count the way a user reads it — "70 MB", "1.4 MB" — for the rejection
+// message, so a turned-away file shows its actual weight next to the limit.
+function formatSize(bytes: number): string {
+  const mb = bytes / (1024 * 1024);
+  return `${mb >= 10 ? Math.round(mb) : mb.toFixed(1)} MB`;
+}
+
 // viewerFor maps a stored mime to the SDK viewer that renders it, so an uploaded file previews as
 // what it is. Anything without a viewer still lists and downloads (the pool only ever stores kinds
 // the assistant can read, so this is just presentation).
@@ -92,14 +110,29 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
     }
   }
 
-  // The one upload path shared by the picker, drag-and-drop and paste. Unusable files are reported
-  // by the backend with a reason; a fully-rejected batch throws (its detail is shown).
+  // The one upload path shared by the picker, drag-and-drop and paste. An over-limit file is turned
+  // away HERE, before any byte is sent — the browser already knows every File.size, so there is no
+  // wait for something that would only be rejected (and no torn stream from the server aborting a
+  // too-large body mid-upload). What is left within the limit is sent; unusable kinds are reported by
+  // the backend with a reason; a fully-rejected batch throws (its detail is shown).
   async function upload(files: File[]) {
     if (files.length === 0 || uploading) return;
+    const tooBig = files.filter((f) => f.size > MAX_FILE_BYTES);
+    const within = files.filter((f) => f.size <= MAX_FILE_BYTES);
+    if (tooBig.length > 0) {
+      ui.toast({
+        title: t('presentr.uploadTooBig'),
+        description: tooBig
+          .map((f) => t('presentr.uploadTooBigItem', { name: f.name, size: formatSize(f.size), limit: MAX_FILE_MIB }))
+          .join('\n'),
+        variant: 'error',
+      });
+    }
+    if (within.length === 0) return;
     setUploading(true);
     try {
       const fd = new FormData();
-      for (const f of files) fd.append('files', f, f.name);
+      for (const f of within) fd.append('files', f, f.name);
       const res = await api.post<UploadResponse>('docs', fd);
       docsQ.refresh();
       const rejected = res.rejected ?? [];
@@ -197,7 +230,7 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
 
   return (
     <Stack gap={4}>
-      <Stack direction="row" justify="between" align="center" gap={3}>
+      <Stack direction="row" justify="between" align="start" gap={3}>
         <Stack gap={0}>
           <Text weight="semibold">{t('presentr.docsHeading')}</Text>
           <Text variant="caption" color="tertiary">
@@ -208,6 +241,7 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
           ref={fileInputRef}
           type="file"
           multiple
+          accept={ACCEPT_HINT}
           className="hidden"
           onChange={(e) => {
             const files = Array.from(e.target.files ?? []);
@@ -215,18 +249,25 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
             if (files.length) void upload(files);
           }}
         />
-        <DropdownMenu
-          align="end"
-          trigger={
-            <Button variant="primary" iconLeft={<PlusIcon />} loading={uploading}>
-              {t('presentr.add')}
-            </Button>
-          }
-          items={[
-            { id: 'text', label: t('presentr.addText'), icon: <FileTextIcon />, onSelect: () => setAdding(true) },
-            { id: 'files', label: t('presentr.uploadFiles'), icon: <UploadIcon />, onSelect: () => fileInputRef.current?.click() },
-          ]}
-        />
+        <Stack gap={1} align="end">
+          <DropdownMenu
+            align="end"
+            trigger={
+              <Button variant="primary" iconLeft={<PlusIcon />} loading={uploading}>
+                {t('presentr.add')}
+              </Button>
+            }
+            items={[
+              { id: 'text', label: t('presentr.addText'), icon: <FileTextIcon />, onSelect: () => setAdding(true) },
+              { id: 'files', label: t('presentr.uploadFiles'), icon: <UploadIcon />, onSelect: () => fileInputRef.current?.click() },
+            ]}
+          />
+          {/* The access point names what it accepts — kinds and size — so the limit is known before it
+              is reached (Intuitiv by Design), not discovered through a failed upload. */}
+          <Text variant="caption" color="tertiary">
+            {t('presentr.uploadHint', { limit: MAX_FILE_MIB })}
+          </Text>
+        </Stack>
       </Stack>
 
       <Stack direction="row" gap={4} align="stretch">
