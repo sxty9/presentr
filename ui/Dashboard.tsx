@@ -30,7 +30,7 @@ function tabFromPath(path: string): TabId {
   return (TAB_IDS as readonly string[]).includes(seg) ? (seg as TabId) : 'docs';
 }
 
-export function Dashboard({ user, api, apiFor, nav, ui }: ServiceContextProps) {
+export function Dashboard({ user, api, nav, ui }: ServiceContextProps) {
   const t = useT();
 
   // Gate the whole surface on the one right, exactly as the backend does. A user without it
@@ -55,8 +55,8 @@ export function Dashboard({ user, api, apiFor, nav, ui }: ServiceContextProps) {
     <Stack gap={4}>
       <SegmentedControl options={options} value={active} onChange={(v) => nav.navigate(v)} />
       {active === 'docs' && <DocsTab api={api} ui={ui} />}
-      {active === 'connection' && <ConnectionTab api={api} apiFor={apiFor} ui={ui} />}
-      {active === 'chat' && <ChatTab api={api} apiFor={apiFor} ui={ui} />}
+      {active === 'connection' && <ConnectionTab api={api} ui={ui} />}
+      {active === 'chat' && <ChatTab api={api} ui={ui} />}
     </Stack>
   );
 }

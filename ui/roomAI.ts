@@ -1,33 +1,18 @@
-// The room's AI access point. presentr asks the shared aigentic service two things — "explain the
-// room" (Chat) and "derive the wiring from the documents" (Connection) — and both must ground the
-// model in the SAME source: the room's document pool. This module is that single access point, so
-// the grounding and the aigentic /run envelope live in ONE place instead of being re-derived per
-// tab (Zugangspunkt wiederverwenden; the two tabs are no longer similar siblings).
-//
-// aigentic's /run contract is mirrored locally (see types.ts), never imported: a service UI may
-// depend only on @holisdk/ui and react. Every answer carries the model that produced it
-// (Kennzeichnungspflicht für KI-Modellantworten) — the caller labels its bubble/turn from
-// AigenticResult.model/engine.
+// The room's AI access point. presentr asks the room's assistant two things — "explain the room"
+// (Chat) and "derive the wiring from the documents" (Connection) — and both must ground the model in
+// the SAME source: the room's document pool. That grounding now lives on presentr's BACKEND (POST
+// ask), because the pool holds uploaded PDFs and images whose bytes aigentic reads natively:
+// assembling the grounding server-side keeps those bytes off the wire to the browser and back
+// (Portionierte Daten) and keeps ONE access point to the room AI. So this module is a thin client of
+// that endpoint — the Chat tab and the Connection diagram differ only in their prompt and requested
+// output shape. Every answer carries the model that produced it; the caller labels its bubble/turn
+// from AskResult.model/engine.
 import type { ServiceContextProps } from '@holisdk/ui';
-import type { AigenticRequest, AigenticResult, Document, PrizmEnvelope } from './types';
+import type { AskRequest, AskResult } from './types';
 
-// The "Ask AI" standard: let aigentic pick the best engine it can offer (local ollama or Claude).
-const ENGINE = 'choose';
-
-// The room's documents as grounding context for the model: every document that carries text, as an
-// inline markdown part. This is what makes an answer specific to THIS room rather than generic.
-export function roomGrounding(docs: Document[]): NonNullable<AigenticRequest['inline']> {
-  return docs
-    .filter((d) => d.content && d.content.trim())
-    .map((d) => ({ path: d.title || 'document', content: d.content, mediaType: 'text/markdown' }));
-}
-
-// Ask the room assistant. One place owns the engine kind, the prizm envelope and unwrapping its
-// result, so Chat and Connection differ only in their prompt, grounding and requested output format.
-export async function askRoom(apiFor: ServiceContextProps['apiFor'], req: AigenticRequest): Promise<AigenticResult> {
-  const env = await apiFor('aigentic').post<PrizmEnvelope<AigenticResult>>('run', {
-    header: { kind: ENGINE },
-    data: req,
-  });
-  return env?.data ?? { output: '' };
+// Ask the room assistant. presentr's backend grounds the turn in the whole document pool and routes
+// it through aigentic; a disabled/unavailable assistant surfaces as a rejected request the caller
+// reports to the user.
+export async function askRoom(api: ServiceContextProps['api'], req: AskRequest): Promise<AskResult> {
+  return api.post<AskResult>('ask', { prompt: req.prompt, outputFormat: req.outputFormat ?? 'markdown' });
 }

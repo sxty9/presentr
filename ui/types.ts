@@ -26,6 +26,14 @@ export interface DocsResponse {
   docs: Document[];
 }
 
+// POST docs (multipart) — the outcome of a file upload: what landed, and what was turned away with
+// a reason (an unusable file is never silently stored).
+export interface UploadResponse {
+  ok: boolean;
+  documents: Document[];
+  rejected?: { name: string; reason: string }[];
+}
+
 // One turn in the room-assistant conversation (backend internal/store.Message). model/engine label
 // an assistant turn with the aigentic model that produced it; empty on user turns.
 export interface ChatMessage {
@@ -41,25 +49,20 @@ export interface ChatHistory {
   messages: ChatMessage[];
 }
 
-// ── aigentic contract (we call the shared assistant via apiFor('aigentic')) ──────────────────
-// A prizm envelope: the run endpoint takes { header:{kind}, data } and returns { header, data }.
-// data on the way in is an AigenticRequest; on the way out an AigenticResult.
-export interface AigenticRequest {
+// ── the room's AI (presentr's own backend grounds it and routes to aigentic) ──────────────────
+// POST ask — presentr's backend assembles the grounding from the pool (text AND uploaded files) and
+// runs the turn through aigentic on the caller's behalf, so the UI sends only the prompt and the
+// requested answer shape. Every answer carries the model/engine that produced it
+// (Kennzeichnungspflicht für KI-Modellantworten).
+export interface AskRequest {
   prompt: string;
-  inline?: { path: string; content: string; mediaType?: string }[];
-  outputFormat?: string; // "text" | "markdown" | "json"
-  model?: string;
+  outputFormat?: 'text' | 'markdown' | 'json';
 }
 
-export interface AigenticResult {
+export interface AskResult {
   output: string;
   engine?: string;
   model?: string;
-}
-
-export interface PrizmEnvelope<T> {
-  header: { kind: string };
-  data: T;
 }
 
 // ── connection diagram (backend internal/store) ──────────────────────────────────────────────

@@ -27,7 +27,7 @@ import type {
   DiagramView,
   DocsResponse,
 } from '../types';
-import { askRoom, roomGrounding } from '../roomAI';
+import { askRoom } from '../roomAI';
 import {
   EXTRACT_PROMPT,
   NODE_H,
@@ -52,7 +52,7 @@ import {
 // drawn purely from SDK primitives: each device is an absolutely-positioned Box, and each connection
 // is a thin Box rotated to point from one port to the other (see diagramLib.lineBox).
 
-export function ConnectionTab({ api, apiFor, ui }: Pick<ServiceContextProps, 'api' | 'apiFor' | 'ui'>) {
+export function ConnectionTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
   const t = useT();
   const [view, setView] = useState<DiagramView | null>(null); // null while loading
   const [busy, setBusy] = useState(false);
@@ -176,7 +176,8 @@ export function ConnectionTab({ api, apiFor, ui }: Pick<ServiceContextProps, 'ap
         ui.toast({ title: t('presentr.diagramNeedDocs'), variant: 'info' });
         return;
       }
-      const result = await askRoom(apiFor, { prompt: EXTRACT_PROMPT, inline: roomGrounding(docs), outputFormat: 'json' });
+      // The backend grounds the extraction in the whole pool (including uploaded PDFs/images).
+      const result = await askRoom(api, { prompt: EXTRACT_PROMPT, outputFormat: 'json' });
       const g = parseGraph(result.output ?? '');
       if (!g || g.nodes.length === 0) {
         ui.toast({ title: t('presentr.diagramNoResult'), variant: 'info' });

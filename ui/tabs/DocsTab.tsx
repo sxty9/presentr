@@ -1,9 +1,14 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import {
   Badge,
   Button,
   Divider,
+  DropdownMenu,
   Field,
+  FileEntryIcon,
+  FilePreview,
+  FileTextIcon,
+  FileThumb,
   IconButton,
   Input,
   Markdown,
@@ -14,17 +19,35 @@ import {
   Text,
   Textarea,
   TrashIcon,
+  UploadIcon,
   cn,
   useLiveQuery,
   useT,
+  type FileEntry,
   type ServiceContextProps,
+  type TextPayload,
+  type ViewerKind,
 } from '@holisdk/ui';
-import type { DocsResponse, Document } from '../types';
+import type { DocsResponse, Document, UploadResponse } from '../types';
 
-// The document pool — workflow stage 1. A keyboard-navigable list of the room's documents on the
-// left, the selected document rendered as Markdown on the right, and an "Add text" dialog to grow
-// the pool. Reads and writes go through the shared, already-authenticated api client; the backend
-// pool is passive and every write is atomic.
+// The document pool — workflow stage 1. It takes in the room's knowledge three equal ways, exactly
+// as the axioms require of any surface that holds a collection of files: a picker, drag-and-drop onto
+// the list, and paste from the clipboard (a screenshot lands the same as a chosen PDF). Typed text
+// stays a fourth way in, under the same single "Add" access point (no similar siblings). A file is
+// shown for what it is — an image as an image, a PDF readable — through the SDK's file viewers (a
+// service never renders media itself). Reads and writes go through the shared, authenticated api
+// client; the backend pool is passive and every write is atomic.
+
+// viewerFor maps a stored mime to the SDK viewer that renders it, so an uploaded file previews as
+// what it is. Anything without a viewer still lists and downloads (the pool only ever stores kinds
+// the assistant can read, so this is just presentation).
+function viewerFor(mime: string): ViewerKind | null {
+  if (mime.startsWith('image/')) return 'image';
+  if (mime === 'application/pdf') return 'pdf';
+  if (mime.startsWith('text/')) return mime === 'text/markdown' ? 'markdown' : 'text';
+  return null;
+}
+
 export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
   const t = useT();
   const docsQ = useLiveQuery<DocsResponse>(() => api.get<DocsResponse>('docs'), 8000);
@@ -38,6 +61,61 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
   const [description, setDescription] = useState('');
   const [content, setContent] = useState('');
   const [busy, setBusy] = useState(false);
+
+  const [uploading, setUploading] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // The full-screen viewer for a file document, and its lazily-loaded text (for text/markdown files,
+  // whose bytes live out of band). null => closed.
+  const [preview, setPreview] = useState<FileEntry | null>(null);
+  const [previewText, setPreviewText] = useState<TextPayload | null>(null);
+
+  // A file document, as the SDK file components expect it: the id is its virtual path (→ the raw
+  // endpoint), the mime picks the viewer.
+  function toEntry(d: Document): FileEntry {
+    return { name: d.title, path: d.id, kind: 'file', size: d.size, mtime: d.created * 1000, mime: d.mime, viewer: viewerFor(d.mime) };
+  }
+  const rawUrl = (id: string) => api.url(`docs/${id}/raw`);
+  const thumbSources = { mediaUrl: (e: FileEntry) => rawUrl(e.path) };
+
+  function openPreview(d: Document) {
+    const e = toEntry(d);
+    setPreview(e);
+    setPreviewText(null);
+    if (e.viewer === 'text' || e.viewer === 'markdown') {
+      api
+        .raw(`docs/${d.id}/raw`)
+        .then((r) => r.text())
+        .then((text) => setPreviewText({ content: text }))
+        .catch(() => setPreviewText({ content: '' }));
+    }
+  }
+
+  // The one upload path shared by the picker, drag-and-drop and paste. Unusable files are reported
+  // by the backend with a reason; a fully-rejected batch throws (its detail is shown).
+  async function upload(files: File[]) {
+    if (files.length === 0 || uploading) return;
+    setUploading(true);
+    try {
+      const fd = new FormData();
+      for (const f of files) fd.append('files', f, f.name);
+      const res = await api.post<UploadResponse>('docs', fd);
+      docsQ.refresh();
+      const rejected = res.rejected ?? [];
+      if (rejected.length > 0) {
+        ui.toast({
+          title: t('presentr.uploadPartial'),
+          description: rejected.map((r) => `${r.name}: ${r.reason}`).join('\n'),
+          variant: 'info',
+        });
+      }
+    } catch (e) {
+      ui.toast({ title: t('presentr.uploadFailed'), description: (e as Error).message, variant: 'error' });
+    } finally {
+      setUploading(false);
+    }
+  }
 
   async function submit() {
     const ti = title.trim();
@@ -76,7 +154,7 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
   }
 
   // Keyboard navigation for the list (Tastaturnavigation in Listenelementen): arrows move the
-  // selection, Home/End jump to the ends, Delete/Backspace removes the selected document.
+  // selection, Home/End jump to the ends, Enter opens a file's viewer, Delete/Backspace removes it.
   function onListKeyDown(e: React.KeyboardEvent) {
     if (docs.length === 0) return;
     const idx = docs.findIndex((d) => d.id === selectedId);
@@ -92,9 +170,28 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
     } else if (e.key === 'End') {
       e.preventDefault();
       setSelectedId(docs[docs.length - 1].id);
+    } else if (e.key === 'Enter' && selected?.kind === 'file') {
+      e.preventDefault();
+      openPreview(selected);
     } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) {
       e.preventDefault();
       void remove(selectedId);
+    }
+  }
+
+  // Drag-and-drop + paste onto the list (Drag & Drop für Dateisammlungen; Einfügen aus der
+  // Zwischenablage): a dropped or pasted file lands the same as a picked one.
+  function onDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setDragging(false);
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length) void upload(files);
+  }
+  function onPaste(e: React.ClipboardEvent) {
+    const files = Array.from(e.clipboardData.files);
+    if (files.length) {
+      e.preventDefault();
+      void upload(files);
     }
   }
 
@@ -107,21 +204,65 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
             {t('presentr.docsSubtitle')}
           </Text>
         </Stack>
-        <Button variant="primary" iconLeft={<PlusIcon />} onClick={() => setAdding(true)}>
-          {t('presentr.addDoc')}
-        </Button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={(e) => {
+            const files = Array.from(e.target.files ?? []);
+            e.target.value = '';
+            if (files.length) void upload(files);
+          }}
+        />
+        <DropdownMenu
+          align="end"
+          trigger={
+            <Button variant="primary" iconLeft={<PlusIcon />} loading={uploading}>
+              {t('presentr.add')}
+            </Button>
+          }
+          items={[
+            { id: 'text', label: t('presentr.addText'), icon: <FileTextIcon />, onSelect: () => setAdding(true) },
+            { id: 'files', label: t('presentr.uploadFiles'), icon: <UploadIcon />, onSelect: () => fileInputRef.current?.click() },
+          ]}
+        />
       </Stack>
 
       <Stack direction="row" gap={4} align="stretch">
-        <Panel className="w-72 shrink-0 p-2">
-          <Stack gap={1} role="listbox" tabIndex={0} aria-label={t('presentr.docsHeading')} onKeyDown={onListKeyDown}>
+        <Panel
+          className={cn('w-72 shrink-0 p-2 transition-colors', dragging && 'ring-2 ring-accent bg-accent/5')}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragging(true);
+          }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={onDrop}
+        >
+          <Stack
+            gap={1}
+            role="listbox"
+            tabIndex={0}
+            aria-label={t('presentr.docsHeading')}
+            onKeyDown={onListKeyDown}
+            onPaste={onPaste}
+            className="outline-none"
+          >
             {docs.length > 0 ? (
               docs.map((d) => (
-                <DocRow key={d.id} doc={d} selected={d.id === selectedId} onSelect={() => setSelectedId(d.id)} onDelete={() => remove(d.id)} deleteLabel={t('presentr.delete')} />
+                <DocRow
+                  key={d.id}
+                  doc={d}
+                  selected={d.id === selectedId}
+                  onSelect={() => setSelectedId(d.id)}
+                  onOpen={() => (d.kind === 'file' ? openPreview(d) : setSelectedId(d.id))}
+                  onDelete={() => remove(d.id)}
+                  deleteLabel={t('presentr.delete')}
+                />
               ))
             ) : (
               <Text color="secondary" variant="footnote">
-                {docsQ.loading ? '…' : t('presentr.noDocs')}
+                {docsQ.loading ? '…' : dragging ? t('presentr.dropHint') : t('presentr.noDocs')}
               </Text>
             )}
           </Stack>
@@ -131,14 +272,23 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
           {selected ? (
             <Stack gap={3}>
               <Stack direction="row" align="center" gap={2} wrap>
-                <Badge variant="neutral">{selected.kind}</Badge>
+                <Badge variant="neutral">{selected.kind === 'file' ? selected.mime : selected.kind}</Badge>
                 <Text variant="caption" color="tertiary">
                   {t('presentr.byAuthor', { author: selected.author })} · {new Date(selected.created * 1000).toLocaleString()}
                 </Text>
               </Stack>
               {selected.description && <Text color="secondary">{selected.description}</Text>}
               <Divider />
-              <Markdown text={selected.content} />
+              {selected.kind === 'file' ? (
+                <Stack gap={3} align="start">
+                  <FileThumb entry={toEntry(selected)} sources={thumbSources} iconClassName="h-16 w-16" className="max-h-72 w-full" />
+                  <Button variant="secondary" onClick={() => openPreview(selected)}>
+                    {t('presentr.openFile')}
+                  </Button>
+                </Stack>
+              ) : (
+                <Markdown text={selected.content} />
+              )}
             </Stack>
           ) : (
             <Text color="secondary">{t('presentr.selectDoc')}</Text>
@@ -146,10 +296,21 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
         </Panel>
       </Stack>
 
+      <FilePreview
+        open={!!preview}
+        entry={preview}
+        rawUrl={preview ? rawUrl(preview.path) : undefined}
+        text={previewText}
+        onOpenChange={(o) => {
+          if (!o) setPreview(null);
+        }}
+        onDownload={(e) => window.open(rawUrl(e.path), '_blank', 'noopener')}
+      />
+
       <Modal
         open={adding}
         onOpenChange={setAdding}
-        title={t('presentr.addDoc')}
+        title={t('presentr.addText')}
         footer={
           <Stack direction="row" justify="end" gap={2}>
             <Button variant="ghost" onClick={() => setAdding(false)}>
@@ -181,15 +342,21 @@ function DocRow({
   doc,
   selected,
   onSelect,
+  onOpen,
   onDelete,
   deleteLabel,
 }: {
   doc: Document;
   selected: boolean;
   onSelect: () => void;
+  onOpen: () => void;
   onDelete: () => void;
   deleteLabel: string;
 }) {
+  const entry: FileEntry =
+    doc.kind === 'file'
+      ? { name: doc.title, path: doc.id, kind: 'file', size: doc.size, mtime: doc.created * 1000, mime: doc.mime, viewer: viewerFor(doc.mime) }
+      : { name: doc.title, path: doc.id, kind: 'file', size: doc.size, mtime: doc.created * 1000, mime: 'text/markdown', viewer: 'markdown' };
   return (
     <Stack
       role="option"
@@ -199,17 +366,21 @@ function DocRow({
       justify="between"
       gap={2}
       onClick={onSelect}
+      onDoubleClick={onOpen}
       className={cn('px-2 py-1.5 rounded-md cursor-pointer', selected ? 'bg-accent/15 text-text-primary' : 'hover:bg-fill/10')}
     >
-      <Stack gap={0} className="min-w-0">
-        <Text truncate weight={selected ? 'semibold' : 'normal'}>
-          {doc.title}
-        </Text>
-        {doc.description && (
-          <Text variant="caption" color="tertiary" truncate>
-            {doc.description}
+      <Stack direction="row" align="center" gap={2} className="min-w-0">
+        <FileEntryIcon entry={entry} className="h-4 w-4 shrink-0" />
+        <Stack gap={0} className="min-w-0">
+          <Text truncate weight={selected ? 'semibold' : 'normal'}>
+            {doc.title}
           </Text>
-        )}
+          {doc.description && (
+            <Text variant="caption" color="tertiary" truncate>
+              {doc.description}
+            </Text>
+          )}
+        </Stack>
       </Stack>
       <IconButton
         label={deleteLabel}

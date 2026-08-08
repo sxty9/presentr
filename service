@@ -34,6 +34,13 @@ detect_service_id() {
 : "${SERVICE_ADMIN_GROUP:=sudo}"                        # Linux group that confers admin
 : "${HOLISTIC_SECRET_FILE:=/etc/holistic/jwt-secret}"   # shared session-signing secret
 : "${HOLISTIC_GROUP:=holistic}"                         # group that owns the shared secret
+# The room assistant routes AI through the shared aigentic service on the caller's behalf. Both
+# values are opt-in runtime config (no instance specifics baked in): point the secret file at
+# aigentic's shared internal secret to enable the assistant; leave it empty and presentr reports the
+# assistant as "not configured" and degrades gracefully. The URL defaults (in code) to aigentic's
+# loopback port; override only for a non-standard deployment.
+: "${SERVICE_AIGENTIC_SECRET_FILE:=}"                   # path to aigentic's shared internal secret
+: "${SERVICE_AIGENTIC_URL:=}"                           # aigentic base URL; empty => code default
 
 # ── derived paths (depend on the service id) ──────────────────────────────────────
 UNIT="/etc/systemd/system/${SERVICE_ID}.service"
@@ -91,11 +98,34 @@ ensure_go() {
   command -v go >/dev/null || die "Go install failed" 4
 }
 
+# The document pool has two build-time backends: the pure-Go JSON pool (default) and scheme
+# (`-tags scheme`, cgo + the sibling scheme static library). A plain `go build` silently selects
+# the JSON pool, so an update would quietly swap a scheme-backed deployment back to JSON and orphan
+# its data. resolve_build_tags picks the backend deliberately: SERVICE_BUILD_TAGS wins if set;
+# otherwise scheme is chosen automatically when its prebuilt library is present beside the repo,
+# and the JSON pool is used when it is not — the same backend survives every update.
+SCHEME_LIB="$REPO_ROOT/../scheme/target/release/libscheme_ffi.a"
+resolve_build_tags() {
+  case "${SERVICE_BUILD_TAGS:-auto}" in
+    auto) [ -f "$SCHEME_LIB" ] && printf 'scheme' || printf '' ;;
+    none|"") printf '' ;;
+    *) printf '%s' "$SERVICE_BUILD_TAGS" ;;
+  esac
+}
+
 build_daemon() {
   ensure_go
-  log "building ${SERVICE_ID}d..."
+  local tags cgo=0
+  tags="$(resolve_build_tags)"
+  case " $tags " in *" scheme "*) cgo=1 ;; esac
+  if [ "$cgo" = "1" ] && [ ! -f "$SCHEME_LIB" ]; then
+    die "build tags '$tags' need the scheme library at $SCHEME_LIB — build it (cargo build -p scheme-ffi --release) or set SERVICE_BUILD_TAGS=none" 4
+  fi
+  log "building ${SERVICE_ID}d${tags:+ (tags: $tags)}..."
   install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$SERVICE_APP" "$SERVICE_APP/bin"
-  ( cd "$REPO_ROOT/backend" && GOCACHE="/tmp/${SERVICE_ID}-gocache" go build -o "$DAEMON_BIN" "./cmd/${SERVICE_ID}d" )
+  ( cd "$REPO_ROOT/backend" \
+      && GOCACHE="/tmp/${SERVICE_ID}-gocache" CGO_ENABLED="$cgo" \
+         go build ${tags:+-tags "$tags"} -o "$DAEMON_BIN" "./cmd/${SERVICE_ID}d" )
   chown -R "$SERVICE_USER:$SERVICE_USER" "$SERVICE_APP"
 }
 
@@ -113,6 +143,8 @@ Group=$SERVICE_USER
 Environment=HOLISTIC_SECRET_FILE=$HOLISTIC_SECRET_FILE
 # Admin = single Linux source of truth (the sudo group by default).
 Environment=$ADMIN_ENV=$SERVICE_ADMIN_GROUP
+$([ -n "$SERVICE_AIGENTIC_SECRET_FILE" ] && printf 'Environment=AIGENTIC_INTERNAL_SECRET_FILE=%s' "$SERVICE_AIGENTIC_SECRET_FILE")
+$([ -n "$SERVICE_AIGENTIC_URL" ] && printf 'Environment=PRESENTR_AIGENTIC_URL=%s' "$SERVICE_AIGENTIC_URL")
 ExecStart=$DAEMON_BIN --listen 127.0.0.1:$SERVICE_PORT
 Restart=on-failure
 RestartSec=2
