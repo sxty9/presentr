@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Badge,
   Button,
@@ -15,15 +15,18 @@ import {
   Modal,
   Panel,
   PlusIcon,
+  ProgressBar,
   Stack,
   Text,
   Textarea,
   TrashIcon,
   UploadIcon,
+  XIcon,
   cn,
   useLiveQuery,
   useT,
   type FileEntry,
+  type ServiceApiClient,
   type ServiceContextProps,
   type TextPayload,
   type ViewerKind,
@@ -38,12 +41,37 @@ import type { DocsResponse, Document, UploadResponse } from '../types';
 // service never renders media itself). Reads and writes go through the shared, authenticated api
 // client; the backend pool is passive and every write is atomic.
 
-// The per-file upload limit, mirroring backend/internal/api/files.go (maxFileBytes / maxUploadFiles).
-// The server stays the authority; these let the entry point NAME what it accepts and let the UI turn
-// an over-limit file away before a byte is sent — so an oversized file never becomes a stalled upload
-// the server has to abort mid-stream. Keep the two in sync (like USE_RIGHT mirrors the backend right).
-const MAX_FILE_MIB = 20;
+// The per-file upload limit, mirroring backend/internal/api/files.go (maxFileBytes). The server stays
+// the authority; this lets the entry point NAME what it accepts and lets the UI turn an over-limit
+// file away before a byte is sent — so an oversized file never becomes a stalled upload the server
+// has to abort mid-stream. Keep it in sync (like USE_RIGHT mirrors the backend right).
+const MAX_FILE_MIB = 100;
 const MAX_FILE_BYTES = MAX_FILE_MIB * 1024 * 1024;
+
+// Send-progress transport. Real per-file progress (5% vs 95% of an 80 MB file) needs the browser to
+// report how many bytes have gone out, which fetch cannot do — so the shared api client exposes an
+// `upload` method (XMLHttpRequest under the hood) that reports progress and honours an AbortSignal.
+// It is a shared-SDK capability (every service with uploads needs it), consumed here, not rebuilt.
+// It is feature-detected: on a host that predates it, uploads still run (and cancel) through `post`,
+// only without the live percentage — so the Docs tab degrades gracefully instead of breaking.
+type UploadProgressOpts = { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal };
+type UploadCapableApi = ServiceApiClient & {
+  upload?<T>(path: string, body: FormData, opts?: UploadProgressOpts): Promise<T>;
+};
+
+// One file's journey through an upload, shown as its own row (name, size, progress, outcome). The
+// states are visually distinct without any explaining text: queued and uploading advance a bar,
+// added is a full success bar, rejected/canceled/failed stop with a coloured bar and a badge.
+type UploadStatus = 'queued' | 'uploading' | 'done' | 'rejected' | 'canceled' | 'error';
+interface UploadItem {
+  key: string;
+  name: string;
+  size: number;
+  loaded: number;
+  status: UploadStatus;
+  reason?: string;
+  controller?: AbortController;
+}
 // The file kinds the pool accepts (aigentic reads these). A picker hint only — drag/drop and paste
 // bypass it and the server re-checks every file by sniffing its bytes.
 const ACCEPT_HINT =
@@ -80,9 +108,100 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
   const [content, setContent] = useState('');
   const [busy, setBusy] = useState(false);
 
-  const [uploading, setUploading] = useState(false);
   const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // The live per-file upload rows and a ref mirror of them, so the sequential queue runner and the
+  // cancel handler can read the current status without going stale between renders.
+  const [uploads, setUploads] = useState<UploadItem[]>([]);
+  const uploadsRef = useRef<UploadItem[]>([]);
+  useEffect(() => {
+    uploadsRef.current = uploads;
+  }, [uploads]);
+  const uploadKey = useRef(0);
+  const queueRef = useRef<Promise<void>>(Promise.resolve());
+  const uploadApi = api as UploadCapableApi;
+  const uploading = uploads.some((u) => u.status === 'queued' || u.status === 'uploading');
+
+  function patchUpload(key: string, p: Partial<UploadItem>) {
+    setUploads((list) => list.map((it) => (it.key === key ? { ...it, ...p } : it)));
+  }
+  function dismissUpload(key: string) {
+    setUploads((list) => list.filter((it) => it.key !== key));
+  }
+  // Cancel a file mid-flight: an in-progress request is aborted (the browser stops sending); a file
+  // still waiting in the queue is simply marked canceled, and the runner skips it when its turn comes.
+  function cancelUpload(key: string) {
+    const it = uploadsRef.current.find((u) => u.key === key);
+    if (it?.controller) it.controller.abort();
+    else patchUpload(key, { status: 'canceled' });
+  }
+
+  // Send exactly one file as its own request, so each file has its own progress and can be canceled
+  // independently. Uses the SDK's progress-reporting upload when the host provides it, else falls back
+  // to a plain post (still cancelable via the AbortSignal, just without the live percentage).
+  async function sendOne(key: string, file: File) {
+    if (uploadsRef.current.find((u) => u.key === key)?.status === 'canceled') return;
+    const controller = new AbortController();
+    patchUpload(key, { status: 'uploading', loaded: 0, controller });
+    const fd = new FormData();
+    fd.append('files', file, file.name);
+    try {
+      if (uploadApi.upload) {
+        await uploadApi.upload<UploadResponse>('docs', fd, {
+          signal: controller.signal,
+          // Track bytes sent against the file's own size; the request carries a little multipart
+          // overhead on top, so the bar is clamped to 100% (UploadRow) rather than overshooting.
+          onProgress: (loaded) => patchUpload(key, { loaded }),
+        });
+      } else {
+        await api.post<UploadResponse>('docs', fd, { signal: controller.signal });
+      }
+      // A single accepted file answers 200; a rejected one answers an error (caught below). Mark the
+      // bar complete and pull the new document into the list.
+      patchUpload(key, { status: 'done', loaded: file.size, controller: undefined });
+      docsQ.refresh();
+    } catch (e) {
+      const err = e as Error;
+      if (controller.signal.aborted || err.name === 'AbortError') {
+        patchUpload(key, { status: 'canceled', controller: undefined });
+      } else {
+        // The server names WHY (wrong kind, over the limit) in the error detail — surface it verbatim.
+        patchUpload(key, { status: 'rejected', reason: err.message, controller: undefined });
+      }
+    }
+  }
+
+  // Take a batch of chosen/dropped/pasted files onto the per-file upload list. An over-limit file is
+  // turned away HERE as its own rejected row (before any byte is sent), so it is visible alongside the
+  // real uploads instead of a fire-and-forget toast; the rest are queued and sent one at a time.
+  function enqueue(files: File[]) {
+    if (files.length === 0) return;
+    const rows: UploadItem[] = [];
+    const toSend: { key: string; file: File }[] = [];
+    for (const f of files) {
+      const key = `u${uploadKey.current++}`;
+      if (f.size > MAX_FILE_BYTES) {
+        rows.push({
+          key,
+          name: f.name,
+          size: f.size,
+          loaded: 0,
+          status: 'rejected',
+          reason: t('presentr.uploadTooBigItem', { name: f.name, size: formatSize(f.size), limit: MAX_FILE_MIB }),
+        });
+      } else {
+        rows.push({ key, name: f.name, size: f.size, loaded: 0, status: 'queued' });
+        toSend.push({ key, file: f });
+      }
+    }
+    setUploads((list) => [...rows, ...list]);
+    // Chain onto the running queue so files always upload one after another, in order, even across
+    // several drops — one clear "which of five is going now", never five competing bars at once.
+    queueRef.current = queueRef.current.then(async () => {
+      for (const { key, file } of toSend) await sendOne(key, file);
+    });
+  }
 
   // The full-screen viewer for a file document, and its lazily-loaded text (for text/markdown files,
   // whose bytes live out of band). null => closed.
@@ -107,46 +226,6 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
         .then((r) => r.text())
         .then((text) => setPreviewText({ content: text }))
         .catch(() => setPreviewText({ content: '' }));
-    }
-  }
-
-  // The one upload path shared by the picker, drag-and-drop and paste. An over-limit file is turned
-  // away HERE, before any byte is sent — the browser already knows every File.size, so there is no
-  // wait for something that would only be rejected (and no torn stream from the server aborting a
-  // too-large body mid-upload). What is left within the limit is sent; unusable kinds are reported by
-  // the backend with a reason; a fully-rejected batch throws (its detail is shown).
-  async function upload(files: File[]) {
-    if (files.length === 0 || uploading) return;
-    const tooBig = files.filter((f) => f.size > MAX_FILE_BYTES);
-    const within = files.filter((f) => f.size <= MAX_FILE_BYTES);
-    if (tooBig.length > 0) {
-      ui.toast({
-        title: t('presentr.uploadTooBig'),
-        description: tooBig
-          .map((f) => t('presentr.uploadTooBigItem', { name: f.name, size: formatSize(f.size), limit: MAX_FILE_MIB }))
-          .join('\n'),
-        variant: 'error',
-      });
-    }
-    if (within.length === 0) return;
-    setUploading(true);
-    try {
-      const fd = new FormData();
-      for (const f of within) fd.append('files', f, f.name);
-      const res = await api.post<UploadResponse>('docs', fd);
-      docsQ.refresh();
-      const rejected = res.rejected ?? [];
-      if (rejected.length > 0) {
-        ui.toast({
-          title: t('presentr.uploadPartial'),
-          description: rejected.map((r) => `${r.name}: ${r.reason}`).join('\n'),
-          variant: 'info',
-        });
-      }
-    } catch (e) {
-      ui.toast({ title: t('presentr.uploadFailed'), description: (e as Error).message, variant: 'error' });
-    } finally {
-      setUploading(false);
     }
   }
 
@@ -218,13 +297,13 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
     e.preventDefault();
     setDragging(false);
     const files = Array.from(e.dataTransfer.files);
-    if (files.length) void upload(files);
+    if (files.length) enqueue(files);
   }
   function onPaste(e: React.ClipboardEvent) {
     const files = Array.from(e.clipboardData.files);
     if (files.length) {
       e.preventDefault();
-      void upload(files);
+      enqueue(files);
     }
   }
 
@@ -246,7 +325,7 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
           onChange={(e) => {
             const files = Array.from(e.target.files ?? []);
             e.target.value = '';
-            if (files.length) void upload(files);
+            if (files.length) enqueue(files);
           }}
         />
         <Stack gap={1} align="end">
@@ -269,6 +348,26 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
           </Text>
         </Stack>
       </Stack>
+
+      {uploads.length > 0 && (
+        <Panel className="p-3">
+          <Stack gap={2}>
+            <Stack direction="row" align="center" justify="between">
+              <Text variant="caption" color="tertiary">
+                {t('presentr.uploadsHeading')}
+              </Text>
+              {uploads.some((u) => u.status !== 'queued' && u.status !== 'uploading') && (
+                <Button variant="ghost" size="sm" onClick={() => setUploads((list) => list.filter((u) => u.status === 'queued' || u.status === 'uploading'))}>
+                  {t('presentr.uploadClearDone')}
+                </Button>
+              )}
+            </Stack>
+            {uploads.map((u) => (
+              <UploadRow key={u.key} item={u} onCancel={() => cancelUpload(u.key)} onDismiss={() => dismissUpload(u.key)} t={t} />
+            ))}
+          </Stack>
+        </Panel>
+      )}
 
       <Stack direction="row" gap={4} align="stretch">
         <Panel
@@ -434,6 +533,62 @@ function DocRow({
       >
         <TrashIcon />
       </IconButton>
+    </Stack>
+  );
+}
+
+// One upload's row: name, size, a per-file progress bar and its outcome. The bar colour and the
+// badge carry the state on their own — a full green bar means added, a stopped red bar means
+// rejected, amber means canceled — so "done, running, rejected" are told apart at a glance without
+// any explaining text (Intuitiv by Design). While a file is in flight the row offers Cancel; once it
+// has settled it offers Dismiss.
+function UploadRow({
+  item,
+  onCancel,
+  onDismiss,
+  t,
+}: {
+  item: UploadItem;
+  onCancel: () => void;
+  onDismiss: () => void;
+  t: ReturnType<typeof useT>;
+}) {
+  const active = item.status === 'queued' || item.status === 'uploading';
+  const failed = item.status === 'rejected' || item.status === 'error';
+  const pct = item.size > 0 ? Math.min(100, Math.round((item.loaded / item.size) * 100)) : 0;
+  // A bar with no byte count yet (queued, or an in-flight upload the host cannot report progress for)
+  // pulses; otherwise it fills to the real percentage, or all the way for any settled state.
+  const indeterminate = item.status === 'uploading' && item.loaded === 0;
+  const tone = item.status === 'done' ? 'success' : failed ? 'danger' : item.status === 'canceled' ? 'warning' : 'accent';
+  const badge = item.status === 'done' ? 'success' : failed ? 'danger' : item.status === 'canceled' ? 'warning' : 'neutral';
+  const barValue = active ? pct : 100;
+  return (
+    <Stack gap={1}>
+      <Stack direction="row" align="center" justify="between" gap={2}>
+        <Stack direction="row" align="center" gap={2} className="min-w-0">
+          <Text truncate>{item.name}</Text>
+          <Text variant="caption" color="tertiary" className="shrink-0">
+            {formatSize(item.size)}
+          </Text>
+        </Stack>
+        <Stack direction="row" align="center" gap={2} className="shrink-0">
+          {item.status === 'uploading' && !indeterminate && (
+            <Text variant="caption" color="tertiary">
+              {pct}%
+            </Text>
+          )}
+          <Badge variant={badge}>{t(`presentr.uploadState_${item.status}`)}</Badge>
+          <IconButton label={active ? t('presentr.uploadCancel') : t('presentr.uploadDismiss')} size="sm" variant="ghost" onClick={active ? onCancel : onDismiss}>
+            <XIcon />
+          </IconButton>
+        </Stack>
+      </Stack>
+      <ProgressBar value={barValue} indeterminate={indeterminate} tone={tone} />
+      {item.reason && (
+        <Text variant="caption" color="tertiary">
+          {item.reason}
+        </Text>
+      )}
     </Stack>
   );
 }

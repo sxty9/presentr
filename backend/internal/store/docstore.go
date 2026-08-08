@@ -1,5 +1,7 @@
 package store
 
+import "io"
+
 // DocStore is the single access point to the room's document pool, abstracted over its backend so
 // the daemon can be built against either storage engine without the api layer knowing which:
 //
@@ -22,12 +24,24 @@ type DocStore interface {
 	List() []Document
 	Get(id string) (Document, bool)
 	Add(d Document) error
-	// AddFile stores a file document: its metadata record d plus its raw bytes, kept out of band.
-	// The two land so that the document only becomes observable (in List/Get) once its bytes are
-	// safely stored — the metadata write is the single commit point (Atomare Zugriffe).
-	AddFile(d Document, data []byte) error
+	// AddFile stores a file document: its metadata record d plus its raw bytes, STREAMED from src so
+	// the daemon never holds the whole file in memory (a 100 MB upload flows to disk as it arrives).
+	// It writes at most max bytes; a source over the limit stores nothing and returns ErrFileTooLarge.
+	// The bytes land FIRST, then the metadata, so the document only becomes observable (in List/Get)
+	// once its bytes are safely stored — the metadata write is the single commit point (Atomare
+	// Zugriffe). d.Size is stamped from the bytes actually written (the one field a caller cannot
+	// know before the stream is drained); every other field is authored by the caller. Returns the
+	// number of bytes stored.
+	AddFile(d Document, src io.Reader, max int64) (int64, error)
 	// Bytes returns the raw bytes of a file document, and whether they were found. Text documents
 	// carry no bytes (their content is inline in Document.Content), so Bytes reports found=false.
+	// It reads the whole blob into memory, so callers use it only for bounded reads (the AI grounding,
+	// capped well under aigentic's request ceiling); streaming a large file to a client goes through
+	// OpenBlob instead.
 	Bytes(id string) ([]byte, bool)
+	// OpenBlob returns a seekable reader over a file document's raw bytes plus its size, for streaming
+	// the bytes to a client without buffering the whole file (a 100 MB download). The caller must
+	// Close the reader. A missing blob (a text document, or an unknown id) reports found=false.
+	OpenBlob(id string) (io.ReadSeekCloser, int64, bool)
 	Delete(id string) error
 }

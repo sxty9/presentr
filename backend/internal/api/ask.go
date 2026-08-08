@@ -50,10 +50,27 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request, u *auth.User) {
 		return
 	}
 
+	inline, omitted := s.roomGrounding()
+	if len(omitted) > 0 {
+		// Some documents did not fit aigentic's per-request ceiling and were left out of the grounding.
+		// Rather than let the model answer as if it had read the whole pool (a silent, dishonest gap),
+		// tell it plainly which documents it did NOT receive, so its answer can name what it is — and
+		// is not — based on (EHRLICH BLEIBEN). This is the connector staying honest, not a substitute
+		// for real retrieval: splitting a large document into sections and selecting the ones relevant
+		// to a question is an aigentic capability (see roomGrounding) that presentr does not build itself.
+		inline = append([]aigentic.InlineFile{{
+			Path:      "grounding-note",
+			MediaType: "text/markdown",
+			Content: "The room knowledge below is INCOMPLETE for this answer. These documents were too large " +
+				"to include in full and were NOT provided to you: " + strings.Join(omitted, ", ") +
+				". If a complete answer would depend on them, say clearly that you could not read them.",
+		}}, inline...)
+	}
+
 	res, err := s.ai.Run(r.Context(), u.Username, aigentic.Req{
 		Prompt:       prompt,
 		OutputFormat: askFormat(body.OutputFormat),
-		Inline:       s.roomGrounding(),
+		Inline:       inline,
 	})
 	if err != nil {
 		switch {
@@ -71,12 +88,24 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request, u *auth.User) {
 
 // roomGrounding turns the pool into aigentic inline parts: every text document as inline markdown,
 // every uploaded file as its bytes (text inline; images/PDFs base64 with their media type — the
-// forms aigentic reads). Assembly is bounded by maxGroundingBytes; documents past the budget are
-// dropped so one oversized pool cannot blow the request cap.
-func (s *Server) roomGrounding() []aigentic.InlineFile {
+// forms aigentic reads). Assembly is bounded by maxGroundingBytes so one oversized pool cannot blow
+// aigentic's request cap. A document that does not fit is NOT silently dropped: its title is returned
+// in `omitted` so ask can tell both the model and (through it) the user which documents the answer
+// could not draw on (EHRLICH BLEIBEN). A file at presentr's 100 MB upload limit is far larger than
+// this per-request budget, so a big manual lands in the pool and is served in full, but only what
+// fits reaches the AI.
+//
+// THE MISSING BUILDING BLOCK: the honest way to let a big document still inform an answer is to split
+// it into sections, index them, and send only the sections relevant to the question — RAG. That
+// belongs in aigentic, the shared AI service every document-holding service routes through, not
+// re-implemented here (Reuse before Build; Keine ähnlichen Geschwister). aigentic today has no
+// chunking, embedding or retrieval and a hard 32 MiB request ceiling, so presentr's honest option
+// for an over-budget document is to name it as not-consulted rather than fabricate coverage of it.
+func (s *Server) roomGrounding() (inline []aigentic.InlineFile, omitted []string) {
 	docs := s.docs.List()
 	out := make([]aigentic.InlineFile, 0, len(docs))
 	var total int64
+	fits := func(n int) bool { return total+int64(n) <= maxGroundingBytes }
 	for _, d := range docs {
 		switch d.Kind {
 		case "text":
@@ -84,17 +113,26 @@ func (s *Server) roomGrounding() []aigentic.InlineFile {
 			if c == "" {
 				continue
 			}
-			if total+int64(len(c)) > maxGroundingBytes {
+			if !fits(len(c)) {
+				omitted = append(omitted, groundingPath(d.Title))
 				continue
 			}
 			total += int64(len(c))
 			out = append(out, aigentic.InlineFile{Path: groundingPath(d.Title), Content: c, MediaType: "text/markdown"})
 		case "file":
+			// A file over the per-request budget cannot be sent whole (an image cannot be split, a PDF
+			// cannot be chunked here — see the note above). Skip reading its bytes at all and name it,
+			// so a 100 MB blob is never loaded into memory just to be dropped.
+			if !fits(int(d.Size)) {
+				omitted = append(omitted, groundingPath(d.Title))
+				continue
+			}
 			b, ok := s.docs.Bytes(d.ID)
 			if !ok || len(b) == 0 {
 				continue
 			}
-			if total+int64(len(b)) > maxGroundingBytes {
+			if !fits(len(b)) {
+				omitted = append(omitted, groundingPath(d.Title))
 				continue
 			}
 			total += int64(len(b))
@@ -107,7 +145,7 @@ func (s *Server) roomGrounding() []aigentic.InlineFile {
 			out = append(out, part)
 		}
 	}
-	return out
+	return out, omitted
 }
 
 // groundingPath is the display/provenance path aigentic shows for a grounding part; never used for

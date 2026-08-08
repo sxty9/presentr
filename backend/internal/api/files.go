@@ -8,6 +8,7 @@ package api
 // the bytes ride out of band via AddFile. Reading them back for a preview goes through getRaw.
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -22,23 +23,22 @@ import (
 )
 
 const (
-	// maxFileBytes is THE upload limit: the most one file may weigh. It is deliberately coupled to
-	// the grounding path, not free-standing — ask.go budgets maxGroundingBytes (24 MiB of raw bytes)
-	// across the WHOLE pool, and that budget base64-inflates by 4/3 to ~32 MiB on the wire, exactly
-	// aigentic's per-request ceiling. A file heavier than this could never be fully read as room
-	// knowledge, so accepting it would be dishonest. Raising it would require aigentic's ceiling to
-	// rise AND a chunking strategy for large PDFs — out of this task's scope. The UI names this limit
-	// at the entry point and rejects an over-limit file before a byte is sent (a convenience); the
-	// server stays the authority.
-	maxFileBytes   = 20 << 20
+	// maxFileBytes is THE upload limit: the most one file may weigh — 100 MB, big enough for a full
+	// device manual or a floor-plan PDF, the very knowledge the room pool exists to hold. It is NO
+	// LONGER coupled to aigentic's per-request ceiling: a file this large is stored in full and served
+	// in full, and the AI grounding takes only as much of the pool as fits aigentic's request (see
+	// ask.go, which now reports which documents it could and could not fully consider). The bytes are
+	// streamed to disk as they arrive (AddFile), so a 100 MB upload never sits whole in the daemon's
+	// memory. The UI names this limit at the entry point and turns an over-limit file away before a
+	// byte is sent (a convenience); the server stays the authority and re-checks every file.
+	maxFileBytes   = 100 << 20
 	maxUploadFiles = 20
 	// maxUploadBody FOLLOWS from the per-file limit and the file count (one number, not two): the
 	// largest legitimate batch is maxUploadFiles files each at maxFileBytes, plus a small allowance
-	// for the multipart envelope (boundaries/headers). Because it can never be smaller than a single
-	// allowed file, a normally-oversized single file is parsed in full and then turned away with the
-	// NAMED per-file reason below — the browser reads a complete response, not a stream the server
-	// aborted mid-upload. The whole-body reader is thus a last-resort backstop against a body larger
-	// than any legitimate batch, and that case answers a named 413 rather than an abrupt close.
+	// for the multipart envelope (boundaries/headers). It is only a last-resort backstop: the parts
+	// are read as a stream, so an over-limit single file is caught by the per-file limit (a NAMED
+	// rejection) long before this whole-body ceiling, and a body larger than any legitimate batch
+	// answers a named 413 rather than an abrupt close. Nothing is buffered to reach these limits.
 	maxUploadBody = maxUploadFiles*maxFileBytes + (1 << 20)
 )
 
@@ -57,27 +57,12 @@ var acceptedImages = map[string]bool{
 // so the UI can surface per-file outcomes uniformly.
 func (s *Server) uploadFiles(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBody)
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		// A body larger than the largest legitimate batch trips the whole-body reader. Answer with a
-		// named 413 so the rejection ARRIVES as a readable response document, instead of the generic
-		// error that reads as a torn stream. (The UI rejects an over-limit file before sending, so a
-		// real user never reaches this; it is the honest backstop for anything that slips past.)
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
-				"This upload is too large — each file may be up to %d MB, and at most %d files at once", maxFileBytes>>20, maxUploadFiles))
-			return
-		}
+	// Read the multipart body as a STREAM (not ParseMultipartForm, which would buffer every part in
+	// memory or spill it to a temp file first): each part's bytes flow straight into the pool as they
+	// arrive, so a 100 MB file never sits whole in the daemon's memory.
+	mr, err := r.MultipartReader()
+	if err != nil {
 		writeErr(w, http.StatusBadRequest, "Could not read the uploaded files")
-		return
-	}
-	parts := r.MultipartForm.File["files"]
-	if len(parts) == 0 {
-		writeErr(w, http.StatusBadRequest, "No files were uploaded")
-		return
-	}
-	if len(parts) > maxUploadFiles {
-		writeErr(w, http.StatusBadRequest, fmt.Sprintf("Too many files at once — upload at most %d", maxUploadFiles))
 		return
 	}
 
@@ -85,61 +70,99 @@ func (s *Server) uploadFiles(w http.ResponseWriter, r *http.Request, u *auth.Use
 		Name   string `json:"name"`
 		Reason string `json:"reason"`
 	}
-	accepted := make([]store.Document, 0, len(parts))
+	accepted := make([]store.Document, 0)
 	rejected := make([]rejection, 0)
 
-	for _, fh := range parts {
-		name := cleanName(fh.Filename)
-		if fh.Size == 0 {
-			rejected = append(rejected, rejection{name, "the file is empty"})
-			continue
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
 		}
-		if fh.Size > maxFileBytes {
-			rejected = append(rejected, rejection{name, fmt.Sprintf("%d MB is over the %d MB limit for one file", fh.Size>>20, maxFileBytes>>20)})
-			continue
-		}
-		f, err := fh.Open()
 		if err != nil {
-			rejected = append(rejected, rejection{name, "could not be read"})
+			// A body past the whole-batch ceiling trips the reader mid-stream. Answer with a named
+			// 413 so the rejection ARRIVES as a readable response, not a torn stream. (The UI turns an
+			// over-limit file away before sending, so a real user never reaches this backstop.)
+			if isBodyTooLarge(err) {
+				writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+					"This upload is too large — each file may be up to %d MB, and at most %d files at once", maxFileBytes>>20, maxUploadFiles))
+				return
+			}
+			writeErr(w, http.StatusBadRequest, "Could not read the uploaded files")
+			return
+		}
+		if part.FormName() != "files" {
+			part.Close()
 			continue
 		}
-		data, err := io.ReadAll(io.LimitReader(f, maxFileBytes+1))
-		f.Close()
-		if err != nil {
-			rejected = append(rejected, rejection{name, "could not be read"})
-			continue
-		}
-		if len(data) == 0 {
-			rejected = append(rejected, rejection{name, "the file is empty"})
-			continue
-		}
-		if len(data) > maxFileBytes {
-			rejected = append(rejected, rejection{name, fmt.Sprintf("%d MB is over the %d MB limit for one file", len(data)>>20, maxFileBytes>>20)})
+		name := cleanName(part.FileName())
+		if len(accepted)+len(rejected) >= maxUploadFiles {
+			// Already at the per-request file cap — name the overflow rather than aborting the batch
+			// (the files already stored stay stored). The UI uploads one file per request, so this is
+			// only reached by a hand-built batch.
+			part.Close()
+			rejected = append(rejected, rejection{name, fmt.Sprintf("skipped — at most %d files per upload", maxUploadFiles)})
 			continue
 		}
 
-		mime, ok, reason := classifyUpload(name, data)
+		// Peek the first bytes to classify the file by its content (the same 512-byte window
+		// http.DetectContentType uses), then stream the peek + the rest into the pool without ever
+		// holding the whole file in memory.
+		head := make([]byte, 512)
+		hn, herr := io.ReadFull(part, head)
+		if herr != nil && herr != io.EOF && herr != io.ErrUnexpectedEOF {
+			part.Close()
+			if isBodyTooLarge(herr) {
+				writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+					"This upload is too large — each file may be up to %d MB, and at most %d files at once", maxFileBytes>>20, maxUploadFiles))
+				return
+			}
+			rejected = append(rejected, rejection{name, "could not be read"})
+			continue
+		}
+		head = head[:hn]
+		if hn == 0 {
+			part.Close()
+			rejected = append(rejected, rejection{name, "the file is empty"})
+			continue
+		}
+		mime, ok, reason := classifyUpload(name, head)
 		if !ok {
+			part.Close()
 			rejected = append(rejected, rejection{name, reason})
 			continue
 		}
-		// Author the complete record outside the pool, then hand the bytes over for passive storage.
+		// Author the complete record outside the pool, then stream the bytes over for passive
+		// storage; the pool stamps Size from the bytes it writes and reports an over-limit file.
 		d := store.Document{
 			ID:      store.NewID(),
 			Title:   name,
 			Kind:    "file",
 			Mime:    mime,
-			Size:    int64(len(data)),
 			Author:  u.Username,
 			Created: time.Now().Unix(),
 		}
-		if err := s.docs.AddFile(d, data); err != nil {
+		n, err := s.docs.AddFile(d, io.MultiReader(bytes.NewReader(head), part), maxFileBytes)
+		part.Close()
+		switch {
+		case errors.Is(err, store.ErrFileTooLarge):
+			rejected = append(rejected, rejection{name, fmt.Sprintf("is over the %d MB limit for one file", maxFileBytes>>20)})
+			continue
+		case isBodyTooLarge(err):
+			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+				"This upload is too large — each file may be up to %d MB, and at most %d files at once", maxFileBytes>>20, maxUploadFiles))
+			return
+		case err != nil:
 			rejected = append(rejected, rejection{name, "could not be saved"})
 			continue
 		}
+		d.Size = n
 		accepted = append(accepted, d)
 	}
 
+	if len(accepted) == 0 && len(rejected) == 0 {
+		writeErr(w, http.StatusBadRequest, "No files were uploaded")
+		return
+	}
 	if len(accepted) == 0 {
 		// Nothing usable landed — surface the first reason as the error so a single-file upload
 		// gets a clear rejection, while still carrying the full per-file list.
@@ -153,8 +176,18 @@ func (s *Server) uploadFiles(w http.ResponseWriter, r *http.Request, u *auth.Use
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "documents": accepted, "rejected": rejected})
 }
 
+// isBodyTooLarge reports whether err is (or wraps) the MaxBytesReader's over-limit error, which the
+// whole-batch ceiling raises mid-stream. It is answered with a named 413, not a torn stream.
+func isBodyTooLarge(err error) bool {
+	var e *http.MaxBytesError
+	return errors.As(err, &e)
+}
+
 // getRaw streams a file document's raw bytes so the SDK viewers can render it (an image as an image,
-// a PDF as a readable PDF). Read-only and right-gated; text documents carry no bytes and 404 here.
+// a PDF as a readable PDF). It STREAMS the blob straight from storage via http.ServeContent rather
+// than buffering it, so serving a 100 MB file costs no matching chunk of memory, and range requests
+// (a PDF viewer seeking, a video scrubbing) are answered from the seekable blob. Read-only and
+// right-gated; text documents carry no bytes and 404 here.
 func (s *Server) getRaw(w http.ResponseWriter, r *http.Request, _ *auth.User) {
 	id := r.PathValue("id")
 	d, ok := s.docs.Get(id)
@@ -162,29 +195,32 @@ func (s *Server) getRaw(w http.ResponseWriter, r *http.Request, _ *auth.User) {
 		writeErr(w, http.StatusNotFound, "File not found")
 		return
 	}
-	b, ok := s.docs.Bytes(id)
+	rc, _, ok := s.docs.OpenBlob(id)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "File not found")
 		return
 	}
+	defer rc.Close()
 	mime := d.Mime
 	if mime == "" {
 		mime = "application/octet-stream"
 	}
 	w.Header().Set("Content-Type", mime)
 	// nosniff: serve exactly the stored type, so an uploaded file can never be reinterpreted as
-	// active content by the browser.
+	// active content by the browser. ServeContent honours this Content-Type (it only sniffs when the
+	// header is unset).
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Disposition", "inline; filename=\""+sanitizeHeaderFilename(d.Title)+"\"")
 	w.Header().Set("Cache-Control", "private, no-store")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(b)
+	http.ServeContent(w, r, d.Title, time.Unix(d.Created, 0), rc)
 }
 
 // classifyUpload decides the stored mime of an upload and whether presentr accepts it, from the
-// bytes (sniffed) and the filename. It accepts only what aigentic can read as context: the four
-// raster image formats (vision), PDF (document), and text (by sniff or by valid-UTF-8 content).
-// Everything else is rejected with a reason naming the detected type.
+// file's leading bytes (the sniff window) and its filename. It accepts only what aigentic can read
+// as context: the four raster image formats (vision), PDF (document), and text (by sniff or by
+// valid-UTF-8 content). Everything else is rejected with a reason naming the detected type. Only the
+// head is examined — the standard 512-byte content-sniff window — so it works on a streamed upload
+// whose full bytes are never held at once (data is already the peeked head).
 func classifyUpload(name string, data []byte) (mime string, ok bool, reason string) {
 	head := data
 	if len(head) > 512 {

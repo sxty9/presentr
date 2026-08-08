@@ -21,8 +21,10 @@ package store
 import "C"
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -107,10 +109,21 @@ func (s *SchemeDocs) Add(d Document) error {
 // metadata at documents/<id>. The bytes are written FIRST, so the document only becomes observable
 // (in List/Get) once the metadata node exists — a reader never sees a file entry whose bytes are
 // missing (Atomare Zugriffe). The metadata carries no inline bytes; Bytes reaches the blob node.
-func (s *SchemeDocs) AddFile(d Document, data []byte) error {
+// d.Size is stamped from the bytes actually stored. Unlike the JSON pool, scheme's FFI takes a whole
+// buffer per node, so the bytes are drained into memory here (bounded by max) before the put — a
+// 100 MB upload transiently costs ~100 MB of memory on the scheme backend; the pure-Go pool streams.
+func (s *SchemeDocs) AddFile(d Document, src io.Reader, max int64) (int64, error) {
+	data, err := io.ReadAll(io.LimitReader(src, max+1))
+	if err != nil {
+		return 0, err
+	}
+	if int64(len(data)) > max {
+		return 0, ErrFileTooLarge
+	}
+	d.Size = int64(len(data))
 	meta, err := json.Marshal(d)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	desc := strings.TrimSpace(d.Description)
 	if desc == "" {
@@ -122,9 +135,12 @@ func (s *SchemeDocs) AddFile(d Document, data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.putLocked(blobPrefix+"/"+d.ID, desc, data); err != nil {
-		return err
+		return 0, err
 	}
-	return s.putLocked(docPrefix+"/"+d.ID, desc, meta)
+	if err := s.putLocked(docPrefix+"/"+d.ID, desc, meta); err != nil {
+		return 0, err
+	}
+	return d.Size, nil
 }
 
 // Bytes returns the raw bytes of a file document (its blobs/<id> node). Absence (a text document or
@@ -141,6 +157,24 @@ func (s *SchemeDocs) Bytes(id string) ([]byte, bool) {
 	}
 	return b, true
 }
+
+// OpenBlob returns a seekable reader over a file document's bytes plus its size, for streaming to a
+// client. scheme's FFI hands back a whole buffer (no partial reads), so the bytes are read into
+// memory and wrapped in a bytes.Reader; the pure-Go pool serves straight from the file instead. A
+// missing blob reports found=false.
+func (s *SchemeDocs) OpenBlob(id string) (io.ReadSeekCloser, int64, bool) {
+	b, ok := s.Bytes(id)
+	if !ok {
+		return nil, 0, false
+	}
+	return nopSeekCloser{bytes.NewReader(b)}, int64(len(b)), true
+}
+
+// nopSeekCloser adapts a *bytes.Reader (a ReadSeeker) to the ReadSeekCloser OpenBlob returns; the
+// in-memory reader needs no close.
+type nopSeekCloser struct{ *bytes.Reader }
+
+func (nopSeekCloser) Close() error { return nil }
 
 // putLocked writes one described node at path (caller holds s.mu). scheme requires a non-empty
 // description on every node, so desc must already be non-empty.

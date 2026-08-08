@@ -1,9 +1,13 @@
 package store
 
 import (
+	"bytes"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -188,18 +192,84 @@ func TestFsyncDir(t *testing.T) {
 	}
 }
 
-// addFile builds a file record outside the pool (as the api layer does) and stores it with its raw
-// bytes via the passive AddFile.
+// addFile builds a file record outside the pool (as the api layer does) and streams its raw bytes
+// in via the passive AddFile; Size is stamped by the pool from the bytes written.
 func addFile(t *testing.T, p *DocPool, id, name, mime string, data []byte) Document {
 	t.Helper()
 	d := Document{
 		ID: id, Title: name, Kind: "file", Mime: mime,
-		Description: name, Size: int64(len(data)), Author: "ada", Created: time.Now().Unix(),
+		Description: name, Author: "ada", Created: time.Now().Unix(),
 	}
-	if err := p.AddFile(d, data); err != nil {
+	n, err := p.AddFile(d, bytes.NewReader(data), 100<<20)
+	if err != nil {
 		t.Fatalf("AddFile: %v", err)
 	}
+	if n != int64(len(data)) {
+		t.Fatalf("AddFile stored %d bytes, want %d", n, len(data))
+	}
+	d.Size = n
 	return d
+}
+
+// A file streamed in over the byte limit stores nothing and reports ErrFileTooLarge — no partial
+// blob, no metadata, no leftover temp file — so an over-limit upload can be turned away cleanly.
+func TestAddFileOverLimitStoresNothing(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	p, err := OpenDocs(filepath.Join(dir, "docs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := Document{ID: NewID(), Title: "huge", Kind: "file", Mime: "application/pdf", Created: time.Now().Unix()}
+	// The limit is 1 MiB; the source is 1 MiB + 1 byte, one byte past the ceiling.
+	src := io.LimitReader(zeros{}, (1<<20)+1)
+	if _, err := p.AddFile(d, src, 1<<20); !errors.Is(err, ErrFileTooLarge) {
+		t.Fatalf("AddFile of an over-limit stream: err=%v, want ErrFileTooLarge", err)
+	}
+	if _, ok := p.Get(d.ID); ok {
+		t.Fatal("over-limit file left metadata behind")
+	}
+	if _, ok := p.Bytes(d.ID); ok {
+		t.Fatal("over-limit file left a blob behind")
+	}
+	// The blobs directory must hold no leftover temp file from the aborted stream.
+	if entries, err := os.ReadDir(filepath.Join(dir, "blobs")); err == nil {
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".tmp-") {
+				t.Fatalf("aborted over-limit stream left a temp file: %s", e.Name())
+			}
+		}
+	}
+}
+
+// A file exactly at the limit is accepted (the ceiling is inclusive) and streams to a client
+// verbatim via OpenBlob.
+func TestAddFileAtLimitAndOpenBlob(t *testing.T) {
+	p := openDocs(t)
+	raw := bytes.Repeat([]byte{0xab}, 1<<20)
+	d := addFile(t, p, "f1", "at-limit.bin", "application/octet-stream", raw)
+	// OpenBlob streams the same bytes, and reports the size without buffering.
+	rc, size, ok := p.OpenBlob(d.ID)
+	if !ok {
+		t.Fatal("OpenBlob did not find the just-stored blob")
+	}
+	defer rc.Close()
+	if size != int64(len(raw)) {
+		t.Fatalf("OpenBlob size %d, want %d", size, len(raw))
+	}
+	got, _ := io.ReadAll(rc)
+	if !bytes.Equal(got, raw) {
+		t.Fatal("OpenBlob streamed different bytes than were stored")
+	}
+}
+
+// zeros is an infinite reader of NUL bytes, for driving an over-limit stream without allocating it.
+type zeros struct{}
+
+func (zeros) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
 }
 
 // A file document's bytes round-trip out of band: the metadata lists it (with no inline content),

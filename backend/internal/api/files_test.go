@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -133,26 +134,49 @@ func TestUploadAndRaw(t *testing.T) {
 	}
 }
 
-// A single file well over the per-file limit is turned away with the NAMED reason (415 + detail),
-// not a torn stream. 41 MiB is deliberately larger than the former 40 MiB whole-batch cap that used
-// to abort the upload mid-stream before the friendly per-file check could run: the batch body cap
-// now follows from the per-file limit, so the file parses in full and the named rejection is reached.
+// zeros is an infinite reader of NUL bytes, used to stream a large upload body WITHOUT allocating it
+// — the file flows through the daemon as it would over the network, exercising the streaming path.
+type zeros struct{}
+
+func (zeros) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
+}
+
+// streamUpload builds a POST /docs whose multipart body is generated on the fly (via a pipe), so a
+// 100 MB file never sits whole in the test's memory. The part carries head followed by NUL padding
+// up to total bytes.
+func streamUpload(t *testing.T, field, name string, head []byte, total int64) *http.Request {
+	t.Helper()
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	ct := mw.FormDataContentType()
+	go func() {
+		w, err := mw.CreateFormFile(field, name)
+		if err == nil {
+			_, err = w.Write(head)
+		}
+		if err == nil && total > int64(len(head)) {
+			_, err = io.CopyN(w, zeros{}, total-int64(len(head)))
+		}
+		mw.Close()
+		pw.CloseWithError(err)
+	}()
+	req := httptest.NewRequest(http.MethodPost, "/api/services/presentr/docs", pr)
+	req.Header.Set("Content-Type", ct)
+	return req
+}
+
+// A single file one byte over the per-file limit is turned away with the NAMED reason (415 + detail),
+// never a torn stream — even though its bytes are read as a stream, not buffered. This is the honest
+// property the previous task established (PR #8), preserved above the new 100 MB limit.
 func TestUploadOversizedFileNamedRejection(t *testing.T) {
 	s := newServer(t)
 
-	// A PDF header followed by padding — the size check fires before classification, so the padding's
-	// type is irrelevant; what matters is that fh.Size exceeds maxFileBytes.
-	big := make([]byte, 41<<20)
-	copy(big, []byte("%PDF-1.7\n"))
-
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	w, _ := mw.CreateFormFile("files", "huge-manual.pdf")
-	w.Write(big)
-	mw.Close()
-
-	req := httptest.NewRequest(http.MethodPost, "/api/services/presentr/docs", &buf)
-	req.Header.Set("Content-Type", mw.FormDataContentType())
+	// A PDF header followed by NUL padding, one byte past the 100 MB per-file limit.
+	req := streamUpload(t, "files", "huge-manual.pdf", []byte("%PDF-1.7\n"), maxFileBytes+1)
 	rec := httptest.NewRecorder()
 	s.uploadFiles(rec, req, user())
 
@@ -171,12 +195,42 @@ func TestUploadOversizedFileNamedRejection(t *testing.T) {
 	if len(out.Rejected) != 1 || out.Rejected[0].Name != "huge-manual.pdf" {
 		t.Fatalf("rejected = %+v, want exactly huge-manual.pdf", out.Rejected)
 	}
-	// The reason must name the limit — an honest rejection, never a bare failure.
-	if !strings.Contains(out.Rejected[0].Reason, "20 MB limit") {
-		t.Fatalf("rejection reason %q must name the 20 MB per-file limit", out.Rejected[0].Reason)
+	// The reason and the detail must name the 100 MB limit — an honest rejection, never a bare failure.
+	if !strings.Contains(out.Rejected[0].Reason, "100 MB limit") {
+		t.Fatalf("rejection reason %q must name the 100 MB per-file limit", out.Rejected[0].Reason)
 	}
-	if !strings.Contains(out.Detail, "20 MB limit") {
-		t.Fatalf("detail %q must name the 20 MB per-file limit", out.Detail)
+	if !strings.Contains(out.Detail, "100 MB limit") {
+		t.Fatalf("detail %q must name the 100 MB per-file limit", out.Detail)
+	}
+}
+
+// A file exactly AT the 100 MB limit (the boundary just under "too large") is accepted and streamed
+// into the pool in full — the limit is inclusive, and the streaming ingest handles a full-size file.
+func TestUploadAtLimitAccepted(t *testing.T) {
+	s := newServer(t)
+
+	req := streamUpload(t, "files", "manual.pdf", []byte("%PDF-1.7\n"), maxFileBytes)
+	rec := httptest.NewRecorder()
+	s.uploadFiles(rec, req, user())
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("at-limit upload status %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Documents []store.Document                `json:"documents"`
+		Rejected  []struct{ Name, Reason string } `json:"rejected"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Rejected) != 0 {
+		t.Fatalf("at-limit file was rejected: %+v", out.Rejected)
+	}
+	if len(out.Documents) != 1 || out.Documents[0].Mime != "application/pdf" {
+		t.Fatalf("accepted = %+v, want one application/pdf document", out.Documents)
+	}
+	if out.Documents[0].Size != maxFileBytes {
+		t.Fatalf("stored size %d, want %d (the full file)", out.Documents[0].Size, int64(maxFileBytes))
 	}
 }
 

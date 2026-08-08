@@ -13,6 +13,7 @@ package store
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -113,25 +114,31 @@ func (p *DocPool) Add(d Document) error {
 	return err
 }
 
-// AddFile stores a file document: its raw bytes are written out of band FIRST (atomically), then
-// the metadata record is appended (atomically). The document only becomes observable once the
-// metadata append lands, so a reader never sees a file entry whose bytes are missing; a crash
-// between the two leaves only an orphan blob (invisible, harmless). A failed metadata append
-// removes the just-written blob so nothing is left behind.
-func (p *DocPool) AddFile(d Document, data []byte) error {
+// AddFile stores a file document: its raw bytes are STREAMED out of band FIRST (atomically, never
+// held whole in memory), then the metadata record is appended (atomically). The bytes flow straight
+// from src to the blob file; a source over max stores nothing and returns ErrFileTooLarge. d.Size is
+// stamped from the bytes actually written — the one field a caller cannot know before the stream is
+// drained. The document only becomes observable once the metadata append lands, so a reader never
+// sees a file entry whose bytes are missing; a crash between the two leaves only an orphan blob
+// (invisible, harmless). A failed metadata append removes the just-written blob so nothing is left
+// behind.
+func (p *DocPool) AddFile(d Document, src io.Reader, max int64) (int64, error) {
 	blob := filepath.Join(p.blobDir, d.ID)
-	if _, err := atomicWrite(blob, data); err != nil {
-		return err
+	n, err := streamBlob(blob, src, max)
+	if err != nil {
+		return 0, err
 	}
+	d.Size = n
 	if err := p.Add(d); err != nil {
 		_ = os.Remove(blob) // roll back the orphan blob; best-effort
-		return err
+		return 0, err
 	}
-	return nil
+	return n, nil
 }
 
 // Bytes returns the raw bytes of a file document. A missing blob (a text document, or an unknown
-// id) reports found=false.
+// id) reports found=false. It buffers the whole blob, so it serves only bounded reads (the AI
+// grounding); streaming a large file to a client goes through OpenBlob.
 func (p *DocPool) Bytes(id string) ([]byte, bool) {
 	if id == "" {
 		return nil, false
@@ -141,6 +148,25 @@ func (p *DocPool) Bytes(id string) ([]byte, bool) {
 		return nil, false
 	}
 	return b, true
+}
+
+// OpenBlob opens a file document's blob for streaming, returning the reader and its size. The blob
+// is one plain file, so os.Open gives a seekable reader (http.ServeContent can answer range
+// requests from it) that the caller closes. A missing blob reports found=false.
+func (p *DocPool) OpenBlob(id string) (io.ReadSeekCloser, int64, bool) {
+	if id == "" {
+		return nil, 0, false
+	}
+	f, err := os.Open(filepath.Join(p.blobDir, id))
+	if err != nil {
+		return nil, 0, false
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, 0, false
+	}
+	return f, fi.Size(), true
 }
 
 // Delete removes the document with the given id. Missing id is a no-op (idempotent). Atomic:
