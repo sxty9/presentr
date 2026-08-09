@@ -1,9 +1,13 @@
 package store
 
 import (
+	"bytes"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -185,5 +189,273 @@ func TestFsyncDir(t *testing.T) {
 	}
 	if err := fsyncDir(filepath.Join(dir, "no-such-dir")); err == nil {
 		t.Fatal("fsyncDir returned nil for a missing directory; a failed seal must not look sealed")
+	}
+}
+
+// addFile builds a file record outside the pool (as the api layer does) and streams its raw bytes
+// in via the passive AddFile; Size is stamped by the pool from the bytes written.
+func addFile(t *testing.T, p *DocPool, id, name, mime string, data []byte) Document {
+	t.Helper()
+	d := Document{
+		ID: id, Title: name, Kind: "file", Mime: mime,
+		Description: name, Author: "ada", Created: time.Now().Unix(),
+	}
+	n, err := p.AddFile(d, bytes.NewReader(data), 100<<20)
+	if err != nil {
+		t.Fatalf("AddFile: %v", err)
+	}
+	if n != int64(len(data)) {
+		t.Fatalf("AddFile stored %d bytes, want %d", n, len(data))
+	}
+	d.Size = n
+	return d
+}
+
+// A file streamed in over the byte limit stores nothing and reports ErrFileTooLarge — no partial
+// blob, no metadata, no leftover temp file — so an over-limit upload can be turned away cleanly.
+func TestAddFileOverLimitStoresNothing(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	p, err := OpenDocs(filepath.Join(dir, "docs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := Document{ID: NewID(), Title: "huge", Kind: "file", Mime: "application/pdf", Created: time.Now().Unix()}
+	// The limit is 1 MiB; the source is 1 MiB + 1 byte, one byte past the ceiling.
+	src := io.LimitReader(zeros{}, (1<<20)+1)
+	if _, err := p.AddFile(d, src, 1<<20); !errors.Is(err, ErrFileTooLarge) {
+		t.Fatalf("AddFile of an over-limit stream: err=%v, want ErrFileTooLarge", err)
+	}
+	if _, ok := p.Get(d.ID); ok {
+		t.Fatal("over-limit file left metadata behind")
+	}
+	if _, ok := p.Bytes(d.ID); ok {
+		t.Fatal("over-limit file left a blob behind")
+	}
+	// The blobs directory must hold no leftover temp file from the aborted stream.
+	if entries, err := os.ReadDir(filepath.Join(dir, "blobs")); err == nil {
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".tmp-") {
+				t.Fatalf("aborted over-limit stream left a temp file: %s", e.Name())
+			}
+		}
+	}
+}
+
+// A file exactly at the limit is accepted (the ceiling is inclusive) and streams to a client
+// verbatim via OpenBlob.
+func TestAddFileAtLimitAndOpenBlob(t *testing.T) {
+	p := openDocs(t)
+	raw := bytes.Repeat([]byte{0xab}, 1<<20)
+	d := addFile(t, p, "f1", "at-limit.bin", "application/octet-stream", raw)
+	// OpenBlob streams the same bytes, and reports the size without buffering.
+	rc, size, ok := p.OpenBlob(d.ID)
+	if !ok {
+		t.Fatal("OpenBlob did not find the just-stored blob")
+	}
+	defer rc.Close()
+	if size != int64(len(raw)) {
+		t.Fatalf("OpenBlob size %d, want %d", size, len(raw))
+	}
+	got, _ := io.ReadAll(rc)
+	if !bytes.Equal(got, raw) {
+		t.Fatal("OpenBlob streamed different bytes than were stored")
+	}
+}
+
+// zeros is an infinite reader of NUL bytes, for driving an over-limit stream without allocating it.
+type zeros struct{}
+
+func (zeros) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
+}
+
+// A file document's bytes round-trip out of band: the metadata lists it (with no inline content),
+// Bytes hands back exactly the stored bytes, and a reopened pool still finds both.
+func TestAddFileRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data", "docs.json")
+	p, err := OpenDocs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x00, 0xff}
+	d := addFile(t, p, "img1", "layout.png", "image/png", raw)
+
+	got, ok := p.Bytes(d.ID)
+	if !ok || string(got) != string(raw) {
+		t.Fatalf("Bytes(%s) = %v, %v; want the stored bytes", d.ID, got, ok)
+	}
+	// Metadata carries no inline bytes — the list stays small.
+	list := p.List()
+	if len(list) != 1 || list[0].Content != "" || list[0].Kind != "file" {
+		t.Fatalf("List after AddFile = %+v; want one file with empty inline content", list)
+	}
+
+	p2, err := OpenDocs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := p2.Bytes(d.ID); !ok || string(got) != string(raw) {
+		t.Fatalf("after reopen Bytes(%s) = %v, %v; want the stored bytes", d.ID, got, ok)
+	}
+}
+
+// Deleting a file document drops both its metadata and its bytes; Bytes on a text document or an
+// unknown id reports not-found rather than erroring.
+func TestDeleteFileRemovesBytes(t *testing.T) {
+	p := openDocs(t)
+	d := addFile(t, p, "f1", "manual.pdf", "application/pdf", []byte("%PDF-1.7\n..."))
+	text := addDoc(t, p, "note", "hello")
+
+	if _, ok := p.Bytes(text.ID); ok {
+		t.Fatal("a text document must carry no bytes")
+	}
+	if _, ok := p.Bytes("nope"); ok {
+		t.Fatal("an unknown id must report not-found")
+	}
+	if err := p.Delete(d.ID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, ok := p.Bytes(d.ID); ok {
+		t.Fatal("Bytes still found after Delete; the blob must be gone")
+	}
+	if _, ok := p.Get(d.ID); ok {
+		t.Fatal("metadata still present after Delete")
+	}
+}
+
+// The extract rides WITH the document (no second store): SetExtract stamps the small state fields onto
+// the metadata and keeps the text out of band, ExtractText reads it back, and both survive a reopen.
+// List stays metadata-only — the extract text is never carried inline.
+func TestSetAndGetExtract(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data", "docs.json")
+	p, err := OpenDocs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := addFile(t, p, "f1", "plate.png", "image/png", []byte{0x89, 'P', 'N', 'G'})
+	if err := p.SetExtract(d.ID, Extract{State: "ready", Text: "SN 12345", Source: "ai", Model: "claude", At: 42}); err != nil {
+		t.Fatalf("SetExtract: %v", err)
+	}
+	got, _ := p.Get(d.ID)
+	if got.ExtractState != "ready" || got.ExtractSource != "ai" || got.ExtractModel != "claude" || got.ExtractSize != int64(len("SN 12345")) {
+		t.Fatalf("extract metadata not stamped: %+v", got)
+	}
+	if text, ok := p.ExtractText(d.ID); !ok || text != "SN 12345" {
+		t.Fatalf("ExtractText = %q, %v", text, ok)
+	}
+	// The metadata list must not carry the extract text inline (Portionierte Daten).
+	for _, ld := range p.List() {
+		if ld.ID == d.ID && ld.Content != "" {
+			t.Fatal("List leaked extract/file content into the metadata")
+		}
+	}
+
+	// Survives a reopen from disk.
+	p2, err := OpenDocs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := p2.Get(d.ID); got.ExtractState != "ready" {
+		t.Fatalf("extract state lost on reopen: %+v", got)
+	}
+	if text, ok := p2.ExtractText(d.ID); !ok || text != "SN 12345" {
+		t.Fatalf("extract text lost on reopen: %q %v", text, ok)
+	}
+}
+
+// A failed read records the reason, an unknown id is a no-op, and Delete removes the extract text too.
+func TestExtractFailedAndDelete(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	p, err := OpenDocs(filepath.Join(dir, "docs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := addFile(t, p, "f1", "scan.pdf", "application/pdf", []byte("%PDF-1.7"))
+	if err := p.SetExtract(d.ID, Extract{State: "failed", Error: "no AI", At: 7}); err != nil {
+		t.Fatalf("SetExtract failed: %v", err)
+	}
+	if got, _ := p.Get(d.ID); got.ExtractState != "failed" || got.ExtractError != "no AI" {
+		t.Fatalf("failed read not recorded: %+v", got)
+	}
+	// An extract for a document that no longer exists is discarded, not an error.
+	if err := p.SetExtract("gone", Extract{State: "ready", Text: "x"}); err != nil {
+		t.Fatalf("SetExtract on a missing id must be a no-op: %v", err)
+	}
+
+	// A ready extract's text file is dropped on Delete.
+	if err := p.SetExtract(d.ID, Extract{State: "ready", Text: "layer text"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p.ExtractText(d.ID); !ok {
+		t.Fatal("extract text should be present before delete")
+	}
+	if err := p.Delete(d.ID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, ok := p.ExtractText(d.ID); ok {
+		t.Fatal("extract text still present after Delete")
+	}
+	if entries, err := os.ReadDir(filepath.Join(dir, "extracts")); err == nil {
+		if len(entries) != 0 {
+			t.Fatalf("extracts dir not cleaned after delete: %d entries", len(entries))
+		}
+	}
+}
+
+// The compressed images read out of a file ride beside the extract as part of the SAME entity: they
+// round-trip through disk, are kept off the metadata a List walks (Portionierte Daten), an empty set
+// clears them, and Delete drops them with the document. This is what lets the assistant later be shown
+// the pictures themselves, not only their transcribed text.
+func TestExtractImagesRoundTripAndDelete(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "data", "docs.json")
+	p, err := OpenDocs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.AddFile(Document{ID: "f", Title: "manual.pdf", Kind: "file", Mime: "application/pdf"}, bytes.NewReader([]byte("%PDF-1.7")), 100<<20); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p.ExtractImages("f"); ok {
+		t.Fatalf("a file with no read has no images yet")
+	}
+	imgs := []ExtractImage{{Index: 0, Page: 1, Data: []byte("jpeg-A")}, {Index: 3, Page: 4, Data: []byte("jpeg-B")}}
+	if err := p.SetExtractImages("f", imgs); err != nil {
+		t.Fatal(err)
+	}
+	// The images are out of band: a List/Get stays metadata-only (no image bytes ride the Document).
+	for _, d := range p.List() {
+		if strings.Contains(d.Title, "jpeg") {
+			t.Fatalf("images must not leak onto the metadata list")
+		}
+	}
+	// Reopen from disk: the images survive with their index, page and bytes intact.
+	p2, err := OpenDocs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := p2.ExtractImages("f")
+	if !ok || len(got) != 2 || got[0].Page != 1 || string(got[0].Data) != "jpeg-A" || got[1].Index != 3 || string(got[1].Data) != "jpeg-B" {
+		t.Fatalf("images did not round-trip: ok=%v %+v", ok, got)
+	}
+	// An empty set clears them.
+	if err := p2.SetExtractImages("f", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p2.ExtractImages("f"); ok {
+		t.Fatalf("an empty set must clear the stored images")
+	}
+	// Delete drops the images with the document (write them back first).
+	if err := p2.SetExtractImages("f", imgs); err != nil {
+		t.Fatal(err)
+	}
+	if err := p2.Delete("f"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p2.ExtractImages("f"); ok {
+		t.Fatalf("Delete must drop the stored images")
 	}
 }

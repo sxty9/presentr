@@ -21,9 +21,25 @@ registerMessages({
 
     // Docs tab
     'presentr.docsHeading': 'Document pool',
-    'presentr.docsSubtitle': 'Everything known about the room — manuals, notes, the layout.',
-    'presentr.addDoc': 'Add text',
-    'presentr.noDocs': 'No documents yet. Add what you know about the room.',
+    'presentr.docsSubtitle': 'Everything known about the room — manuals, photos, notes, the layout.',
+    'presentr.addText': 'Write text',
+    'presentr.uploadFiles': 'Upload files',
+    'presentr.openFile': 'Open',
+    'presentr.dropHint': 'Drop files to add them to the room.',
+    'presentr.uploadHint': 'Images, PDFs, text — up to {limit} MB each',
+    'presentr.uploadTooBigItem': '{name} ({size}) is over the {limit} MB limit',
+    // Per-file upload progress (each file uploads on its own, with its own bar and outcome)
+    'presentr.uploadsHeading': 'Uploads',
+    'presentr.uploadClearDone': 'Clear finished',
+    'presentr.uploadCancel': 'Cancel upload',
+    'presentr.uploadDismiss': 'Dismiss',
+    'presentr.uploadState_queued': 'Queued',
+    'presentr.uploadState_uploading': 'Uploading',
+    'presentr.uploadState_done': 'Added',
+    'presentr.uploadState_rejected': 'Rejected',
+    'presentr.uploadState_canceled': 'Canceled',
+    'presentr.uploadState_error': 'Failed',
+    'presentr.noDocs': 'No documents yet. Add what you know about the room — text, PDFs, photos.',
     'presentr.selectDoc': 'Select a document to read it.',
     'presentr.byAuthor': 'Added by {author}',
     'presentr.docTitle': 'Title',
@@ -39,6 +55,37 @@ registerMessages({
     'presentr.deleteTitle': 'Delete document',
     'presentr.deleteConfirm': 'Remove this document from the room pool? This cannot be undone.',
     'presentr.deleteFailed': 'Could not delete the document',
+
+    // Text extraction — the text read once out of an uploaded file, kept beside the file and used to
+    // answer questions. It has TWO independent tracks: the text layer (read exactly and locally, no AI)
+    // and the embedded images (each read on its own by the assistant, named by the page it sits on).
+    'presentr.extractReading': 'Reading text…',
+    'presentr.extractReadingSections': 'Reading — image {done} of {total}',
+    'presentr.extractUnread': 'Text not read',
+    'presentr.extractReadHeading': 'Text read from this file',
+    'presentr.extractFromLayer': 'Read from the document’s text layer — exact, no AI used.',
+    'presentr.extractFromAI': 'Text recognized by the assistant (including text on photos and scans), read by {model}.',
+    'presentr.extractFromMixed': 'Text layer read exactly (no AI); the photos in it were read by {model}.',
+    'presentr.extractPendingBody': 'Reading the text out of this file. This runs once; you can keep working.',
+    'presentr.extractReadingBody': 'This file is large, so it is read in {total} sections. Reading section {done} of {total} — you can keep working; it continues where it left off if interrupted.',
+    'presentr.extractFailedBody': 'The text of this file could not be read. {reason}',
+    'presentr.extractRetry': 'Read again',
+    'presentr.extractRetryFailed': 'Could not start reading the file again',
+    'presentr.extractShow': 'Show the read text',
+    'presentr.extractHide': 'Hide the read text',
+    'presentr.extractEmpty': 'No legible text was found in this file.',
+    'presentr.extractLoadFailed': 'Could not load the read text',
+    // The two tracks, shown side by side while a file is read.
+    'presentr.trackTextHeading': 'Text',
+    'presentr.trackTextReady': 'Text layer read — exact, no AI',
+    'presentr.trackTextNone': 'No text layer — read from images',
+    'presentr.trackImagesHeading': 'Images',
+    'presentr.trackImagesProgress': '{done} of {total} images read',
+    'presentr.trackImagesCurrent': 'Reading {label} — {done} of {total}',
+    'presentr.trackImagesCompressing': 'Compressing image {n} of {total}',
+    'presentr.trackImagesReady': '{total} images read',
+    'presentr.trackImageBadge': 'Images {done}/{total}',
+    'presentr.extractImagesIncomplete': 'The text is ready. Some images have not been read yet — read the remaining images again.',
 
     // Connection tab (the wiring diagram, derived from the documents and editable by hand)
     'presentr.diagramHeading': 'Connection diagram',
@@ -59,10 +106,23 @@ registerMessages({
     'presentr.devicePorts': 'Number of ports',
     'presentr.add': 'Add',
     'presentr.diagramNeedDocs': 'Add some documents first — the diagram is derived from them.',
-    'presentr.diagramNoResult': 'The assistant could not derive a diagram from the documents.',
     'presentr.diagramGenFailed': 'Could not generate the diagram',
     'presentr.diagramSaveFailed': 'Could not save the diagram',
     'presentr.diagramRestoreFailed': 'Could not restore the diagram',
+
+    // The standing outcome of the last "generate from documents" attempt (persistent, not a toast).
+    // "empty": the assistant concluded no connections — it shows its own reason, plus this fallback
+    // when it gave none. "failed": the turn could not finish. "ok": a caption names the model that
+    // produced the diagram (Kennzeichnungspflicht für KI-Modellantworten).
+    'presentr.genEmptyBadge': 'No result',
+    'presentr.genEmptyTitle': 'No connections could be concluded',
+    'presentr.genEmptyBody':
+      'The assistant found no wiring diagram or device list to derive connections from. Add the room’s wiring documents — a cabling diagram or a list of the devices — to the Docs tab, then generate again.',
+    'presentr.genByModel': 'Assessed by {model}',
+    'presentr.genFailedBadge': 'Failed',
+    'presentr.genFailedTitle': 'Generation did not finish',
+    'presentr.genFailedBody': 'The assistant could not finish deriving the diagram. Please try again.',
+    'presentr.genDerivedBy': 'Diagram derived by {model}',
 
     // Chat tab (the assistant — routed through aigentic)
     'presentr.chatHeading': 'Room assistant',
@@ -77,5 +137,15 @@ registerMessages({
     'presentr.chatClear': 'Clear',
     'presentr.chatClearTitle': 'Clear conversation',
     'presentr.chatClearConfirm': 'Delete this conversation? This cannot be undone.',
+
+    // Room-AI progress — the granular steps shown while a turn runs (it runs as a background job, polled
+    // for progress, so the wait shows what is happening rather than a bare spinner).
+    'presentr.askStepGrounding': 'Gathering the room context…',
+    'presentr.askStepSending': 'Room context ready ({docs} documents, {images} images) — asking the assistant…',
+    'presentr.askStepReceived': 'Answer received',
+
+    // Shown instead of a raw proxy/timeout page when the server does not answer a room-AI turn in time.
+    'presentr.serverTimeout': 'The server did not respond in time — please try again.',
+    'presentr.serverError': 'Something went wrong — please try again.',
   },
 });

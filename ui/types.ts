@@ -19,11 +19,61 @@ export interface Document {
   size: number;
   author: string;
   created: number;
+
+  // Extraction — the text read once out of a file (kind "file") and kept beside it, so questions work
+  // with the text, not the raw bytes. state drives what the UI shows; a file uploaded before this
+  // feature carries an empty state.
+  extractState?: 'pending' | 'reading' | 'ready' | 'failed' | '';
+  extractSource?: string; // "text-layer" (read exactly, no AI) | "ai" (from images) | "mixed" (both)
+  extractModel?: string; // the AI model that read it, when images were read (Kennzeichnungspflicht)
+  extractEngine?: string;
+  extractError?: string; // why the read failed (state "failed"); a retry can clear it
+  extractSize?: number;
+
+  // Two independent read tracks, shown separately (the task's decoupling):
+  //   - The TEXT track: extractTextLayer marks that this file's text layer was read exactly and locally,
+  //     the instant the read began — no AI wait. Shown as read immediately, even while images still read.
+  //   - The IMAGE track: extractSectionsDone/Total count the embedded images read out of how many, and
+  //     extractSectionLabel names the most recent one by page ("image on page 6"). A text-layer file whose
+  //     images are still being read is already state "ready" (its text is usable) with done < total.
+  //   - extractSectionPhase names the current sub-step of the image in progress: "compressing" (the
+  //     picture is being downscaled) or "reading" (its compact form is at the vision AI), so the wait
+  //     shows "Compressing image 3 of 11" then "Reading image on page 6", not one opaque counter.
+  extractTextLayer?: boolean;
+  extractSectionsDone?: number;
+  extractSectionsTotal?: number;
+  extractSectionLabel?: string;
+  extractSectionPhase?: 'compressing' | 'reading' | '';
+}
+
+// GET docs/{id}/extract — a file's read state plus the text that was read, so the UI can show exactly
+// what the assistant will draw on.
+export interface ExtractResponse {
+  state: string;
+  source: string;
+  model: string;
+  engine: string;
+  error: string;
+  size: number;
+  textLayer: boolean;
+  sectionsDone: number;
+  sectionsTotal: number;
+  sectionLabel: string;
+  sectionPhase: string;
+  text: string;
 }
 
 // GET docs — the room's documents, newest first.
 export interface DocsResponse {
   docs: Document[];
+}
+
+// POST docs (multipart) — the outcome of a file upload: what landed, and what was turned away with
+// a reason (an unusable file is never silently stored).
+export interface UploadResponse {
+  ok: boolean;
+  documents: Document[];
+  rejected?: { name: string; reason: string }[];
 }
 
 // One turn in the room-assistant conversation (backend internal/store.Message). model/engine label
@@ -41,25 +91,50 @@ export interface ChatHistory {
   messages: ChatMessage[];
 }
 
-// ── aigentic contract (we call the shared assistant via apiFor('aigentic')) ──────────────────
-// A prizm envelope: the run endpoint takes { header:{kind}, data } and returns { header, data }.
-// data on the way in is an AigenticRequest; on the way out an AigenticResult.
-export interface AigenticRequest {
+// ── the room's AI (presentr's own backend grounds it and routes to aigentic) ──────────────────
+// POST ask — presentr's backend assembles the grounding from the pool (text AND uploaded files) and
+// runs the turn through aigentic on the caller's behalf, so the UI sends only the prompt and the
+// requested answer shape. Every answer carries the model/engine that produced it
+// (Kennzeichnungspflicht für KI-Modellantworten).
+export interface AskRequest {
   prompt: string;
-  inline?: { path: string; content: string; mediaType?: string }[];
-  outputFormat?: string; // "text" | "markdown" | "json"
-  model?: string;
+  outputFormat?: 'text' | 'markdown' | 'json';
 }
 
-export interface AigenticResult {
+export interface AskResult {
   output: string;
   engine?: string;
   model?: string;
 }
 
-export interface PrizmEnvelope<T> {
-  header: { kind: string };
-  data: T;
+// POST ask now starts a BACKGROUND job (a grounded turn over a large pool can outlast the edge proxy's
+// ~100s limit and land a raw 524 page in the browser). It answers at once with the job id; the UI polls
+// GET ask/{id} for granular progress and, when done, the answer.
+export interface AskJobStart {
+  jobId: string;
+  state: string;
+  phase: string;
+}
+
+// GET ask/{id} — one background ask job's progress and, once done, its answer. phase drives the granular
+// step the UI shows instead of a bare spinner; docs/images count what the room context carried.
+export interface AskJob {
+  id: string;
+  state: 'running' | 'done' | 'failed';
+  phase: 'grounding' | 'sending' | 'done';
+  docs: number;
+  images: number;
+  output?: string;
+  model?: string;
+  engine?: string;
+  error?: string;
+}
+
+// The granular progress the UI shows while an ask runs (mapped to a localized step label).
+export interface AskProgress {
+  phase: string;
+  docs: number;
+  images: number;
 }
 
 // ── connection diagram (backend internal/store) ──────────────────────────────────────────────
@@ -87,11 +162,24 @@ export interface DiagramGraph {
   nodes: DiagramNode[];
   edges: DiagramEdge[];
 }
+// The outcome of the last "generate from documents" attempt, stored on the shared diagram so it
+// survives a reload and is shown as a STANDING banner (not a vanishing toast): "empty" carries the
+// assistant's own explanation of why it concluded no connections; "failed" carries the failure reason;
+// "ok" carries the model that produced the diagram (Kennzeichnungspflicht für KI-Modellantworten).
+export interface DiagramGeneration {
+  state: '' | 'ok' | 'empty' | 'failed';
+  note?: string;
+  model?: string;
+  engine?: string;
+  at?: number;
+}
+
 // GET/PUT diagram — the current graph plus which state it is in.
 export interface DiagramView extends DiagramGraph {
   state: 'document' | 'manual';
   modified: boolean;
   sourceKey: string;
   generated: number;
+  generation?: DiagramGeneration;
 }
 

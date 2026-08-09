@@ -70,30 +70,46 @@ export function canvasSize(nodes: DiagramNode[]): { w: number; h: number } {
   return { w, h };
 }
 
-// The aigentic prompt that turns the room documents into a device/connection graph.
+// The aigentic prompt that turns the room documents into a device/connection graph. It points the
+// model FIRST at the room's wiring evidence — a cabling diagram or a wiring photo, and any list that
+// names the devices — because in a real room that evidence is a PICTURE (the attachments carry the
+// pictures read out of the documents, so a vision engine sees them). It asks for a cable's type/colour
+// as the edge label, and for a short `note` explaining the outcome — which becomes the persistent
+// message the user reads when no connections could be concluded (Kein stummes Ausbleiben).
 export const EXTRACT_PROMPT =
-  'You are analysing the documents that describe a presentation room. Identify the physical DEVICES ' +
-  '(e.g. projector, laptop, HDMI matrix, speakers, wall plate, control panel) and how they are ' +
-  'CONNECTED to each other. Reply with ONLY a JSON object — no prose, no code fence — of exactly ' +
-  'this shape:\n' +
-  '{"nodes":[{"id":"n1","name":"Projector","symbol":"P","ports":[{"id":"n1p1","name":"HDMI 1"}]}],' +
-  '"edges":[{"from":"n1","fromPort":"n1p1","to":"n2","toPort":"n2p1","label":"HDMI"}]}\n' +
+  'You are analysing the documents AND images that describe a presentation room, to reconstruct its ' +
+  'connection diagram. Study every WIRING or CABLING drawing or photo you are given (a picture that ' +
+  'shows devices joined by cables/lines) and any list that NAMES the devices — these are your primary ' +
+  'evidence, and the pictures are attached to this request. Identify the physical DEVICES (for example: ' +
+  'display or TV, projector, camera, microphone, speaker or soundbar, laptop, control panel or touch ' +
+  'controller, hub, matrix, media player or mini-PC, wall plate, wireless-presentation receiver) and how ' +
+  'they are CONNECTED to one another. Use each cable’s type or colour as the connection label when the ' +
+  'documents show it (for example HDMI, USB, network/LAN, audio/XLR, power). Prefer the exact device ' +
+  'NAMES the documents use.\n' +
+  'Reply with ONLY a JSON object — no prose, no code fence — of exactly this shape:\n' +
+  '{"nodes":[{"id":"n1","name":"Display","symbol":"TV","ports":[{"id":"n1p1","name":"HDMI 1"}]}],' +
+  '"edges":[{"from":"n1","fromPort":"n1p1","to":"n2","toPort":"n2p1","label":"HDMI"}],' +
+  '"note":"one short sentence stating what you concluded, or — if you found none — why"}\n' +
   'Rules: ids are short and unique; every edge references existing node and port ids; symbol is a ' +
-  '1–2 character glyph; give each device a port for each real connector; if the documents do not ' +
-  'describe the room, return {"nodes":[],"edges":[]}.';
+  '1–2 character glyph; give each device a port for each real connector. If the documents genuinely do ' +
+  'not describe the room’s wiring, return {"nodes":[],"edges":[],"note":"<why, e.g. no wiring diagram ' +
+  'or device list was found in the documents>"}.';
 
-// Parse the model's answer into a graph, tolerating prose or a code fence around the JSON. Returns
-// null when nothing usable is found. The backend sanitises further (drops dangling edges, clamps).
-export function parseGraph(output: string): DiagramGraph | null {
+// Parse the model's answer into a graph plus its note, tolerating prose or a code fence around the
+// JSON. Returns null when nothing usable is found. The backend sanitises further (drops dangling
+// edges, clamps). The note is the assistant's own account of the outcome — shown to the user verbatim
+// when no connections were concluded, so the empty case is never a silent, endless spinner.
+export function parseGraph(output: string): (DiagramGraph & { note?: string }) | null {
   if (!output) return null;
   const start = output.indexOf('{');
   const end = output.lastIndexOf('}');
   if (start < 0 || end <= start) return null;
   try {
-    const obj = JSON.parse(output.slice(start, end + 1)) as Partial<DiagramGraph>;
+    const obj = JSON.parse(output.slice(start, end + 1)) as Partial<DiagramGraph> & { note?: unknown };
     return {
       nodes: Array.isArray(obj.nodes) ? obj.nodes : [],
       edges: Array.isArray(obj.edges) ? obj.edges : [],
+      note: typeof obj.note === 'string' ? obj.note : undefined,
     };
   } catch {
     return null;

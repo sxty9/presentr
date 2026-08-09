@@ -11,6 +11,7 @@ import {
   NetworkIcon,
   Panel,
   PlusIcon,
+  ProgressBar,
   Spinner,
   Stack,
   Text,
@@ -22,12 +23,13 @@ import {
 } from '@holisdk/ui';
 import type {
   DiagramEdge,
+  DiagramGeneration,
   DiagramGraph,
   DiagramNode,
   DiagramView,
   DocsResponse,
 } from '../types';
-import { askRoom, roomGrounding } from '../roomAI';
+import { askRoom, askStepLabel, describeAskError } from '../roomAI';
 import {
   EXTRACT_PROMPT,
   NODE_H,
@@ -52,10 +54,11 @@ import {
 // drawn purely from SDK primitives: each device is an absolutely-positioned Box, and each connection
 // is a thin Box rotated to point from one port to the other (see diagramLib.lineBox).
 
-export function ConnectionTab({ api, apiFor, ui }: Pick<ServiceContextProps, 'api' | 'apiFor' | 'ui'>) {
+export function ConnectionTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
   const t = useT();
   const [view, setView] = useState<DiagramView | null>(null); // null while loading
   const [busy, setBusy] = useState(false);
+  const [step, setStep] = useState<string | null>(null); // the granular progress of a running generation
   const [pending, setPending] = useState<{ node: string; port: string } | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [name, setName] = useState('');
@@ -92,7 +95,7 @@ export function ConnectionTab({ api, apiFor, ui }: Pick<ServiceContextProps, 'ap
       const v = await api.put<DiagramView>('diagram', { nodes: next.nodes, edges: next.edges });
       setView(v);
     } catch (e) {
-      ui.toast({ title: t('presentr.diagramSaveFailed'), description: (e as Error).message, variant: 'error' });
+      ui.toast({ title: t('presentr.diagramSaveFailed'), description: describeAskError(t, e), variant: 'error' });
     }
   }
 
@@ -166,32 +169,62 @@ export function ConnectionTab({ api, apiFor, ui }: Pick<ServiceContextProps, 'ap
     if (d.moved) void commit(graphRef.current);
   }
 
-  // Derive the diagram from the documents via aigentic, then install it as the new baseline.
+  // Derive the diagram from the documents via aigentic, then PERSIST the outcome on the shared diagram
+  // — a derived graph, "no connections could be concluded" (with the assistant's own reason), or a
+  // failure — so the result is a standing banner that survives a reload, never a vanishing toast. The
+  // backend grounds the extraction in the whole pool (its text AND the pictures read out of it) and
+  // reports each step of the background turn, which drives the progress bar below.
   async function generate() {
     if (busy) return;
     setBusy(true);
+    setStep(null);
     try {
       const docs = (await api.get<DocsResponse>('docs')).docs ?? [];
       if (docs.length === 0) {
         ui.toast({ title: t('presentr.diagramNeedDocs'), variant: 'info' });
         return;
       }
-      const result = await askRoom(apiFor, { prompt: EXTRACT_PROMPT, inline: roomGrounding(docs), outputFormat: 'json' });
-      const g = parseGraph(result.output ?? '');
-      if (!g || g.nodes.length === 0) {
-        ui.toast({ title: t('presentr.diagramNoResult'), variant: 'info' });
+      // The AI turn runs in the background; a network/timeout/no-engine failure is recorded as a
+      // standing "failed" outcome (with a readable reason) rather than shown once and lost.
+      let result;
+      try {
+        result = await askRoom(api, { prompt: EXTRACT_PROMPT, outputFormat: 'json' }, (p) => setStep(askStepLabel(t, p)));
+      } catch (e) {
+        setView(await api.post<DiagramView>('diagram/generate', { state: 'failed', note: describeAskError(t, e) }));
         return;
       }
-      const v = await api.post<DiagramView>('diagram/generate', {
-        nodes: layout(g.nodes),
-        edges: g.edges,
-        sourceKey: sourceKeyOf(docs),
-      });
-      setView(v);
+      const g = parseGraph(result.output ?? '');
+      const nodes = g?.nodes ?? [];
+      if (nodes.length === 0) {
+        // The assistant concluded no connections. Persist WHY (its own note), so the empty case is a
+        // clear, lasting message instead of an endless spinner with no outcome.
+        setView(
+          await api.post<DiagramView>('diagram/generate', {
+            state: 'empty',
+            note: g?.note ?? (result.output ?? '').trim(),
+            model: result.model,
+            engine: result.engine,
+          }),
+        );
+        return;
+      }
+      setView(
+        await api.post<DiagramView>('diagram/generate', {
+          state: 'ok',
+          nodes: layout(nodes),
+          edges: g?.edges ?? [],
+          sourceKey: sourceKeyOf(docs),
+          note: g?.note ?? '',
+          model: result.model,
+          engine: result.engine,
+        }),
+      );
     } catch (e) {
-      ui.toast({ title: t('presentr.diagramGenFailed'), description: (e as Error).message, variant: 'error' });
+      // The outcome-recording call itself failed (a transient network error) — retriable, so a toast fits.
+      ui.toast({ title: t('presentr.diagramGenFailed'), description: describeAskError(t, e), variant: 'error' });
     } finally {
       setBusy(false);
+      setStep(null);
     }
   }
 
@@ -199,7 +232,7 @@ export function ConnectionTab({ api, apiFor, ui }: Pick<ServiceContextProps, 'ap
     try {
       setView(await api.post<DiagramView>('diagram/restore', {}));
     } catch (e) {
-      ui.toast({ title: t('presentr.diagramRestoreFailed'), description: (e as Error).message, variant: 'error' });
+      ui.toast({ title: t('presentr.diagramRestoreFailed'), description: describeAskError(t, e), variant: 'error' });
     }
   }
 
@@ -240,6 +273,23 @@ export function ConnectionTab({ api, apiFor, ui }: Pick<ServiceContextProps, 'ap
           </Button>
         </Stack>
       </Stack>
+
+      {/* While a generation runs: a progress bar plus the granular step (grounding → asking → answer),
+          so the wait shows what is happening, not just a spinning button. When idle: the standing
+          outcome of the last attempt — the assistant's reason when it concluded no connections, or a
+          failure — read from the diagram so it survives a reload (Zustandserhalt). */}
+      {busy ? (
+        <Stack gap={1}>
+          <ProgressBar value={0} indeterminate tone="accent" className="w-full" />
+          {step && (
+            <Text variant="footnote" color="secondary">
+              {step}
+            </Text>
+          )}
+        </Stack>
+      ) : (
+        <GenerationStatus gen={view.generation} t={t} />
+      )}
 
       <Panel className="p-0 overflow-auto" style={{ maxHeight: '60vh' }}>
         <Box className="relative select-none" style={{ width: size.w, height: size.h }} onPointerDown={() => setPending(null)}>
@@ -380,5 +430,46 @@ export function ConnectionTab({ api, apiFor, ui }: Pick<ServiceContextProps, 'ap
         </Stack>
       </Modal>
     </Stack>
+  );
+}
+
+// The standing outcome of the last "generate from documents" attempt, read from the shared diagram so
+// it persists across reloads and is the same for everyone in the room (never a per-session toast).
+//   - "empty": the assistant concluded no connections — its OWN reason is shown, so the user learns why
+//     and what to do rather than facing an endless spinner with no result (Kein stummes Ausbleiben).
+//   - "failed": the turn could not complete — the failure reason is shown.
+//   - "ok": the diagram was derived — a caption names the model that produced it (Kennzeichnungspflicht).
+// Nothing is shown before the first attempt.
+function GenerationStatus({ gen, t }: { gen?: DiagramGeneration; t: ReturnType<typeof useT> }) {
+  if (!gen || !gen.state || gen.state === 'ok') {
+    if (gen?.state === 'ok' && (gen.engine || gen.model)) {
+      return (
+        <Stack direction="row" align="center" gap={2}>
+          <Badge variant="accent">{gen.engine || 'ai'}</Badge>
+          <Text variant="caption" color="tertiary">
+            {t('presentr.genDerivedBy', { model: gen.model || gen.engine || '' })}
+          </Text>
+        </Stack>
+      );
+    }
+    return null;
+  }
+  const failed = gen.state === 'failed';
+  const note = (gen.note ?? '').trim();
+  return (
+    <Panel className="p-3">
+      <Stack direction="row" gap={2} align="start">
+        <Badge variant={failed ? 'danger' : 'warning'}>{failed ? t('presentr.genFailedBadge') : t('presentr.genEmptyBadge')}</Badge>
+        <Stack gap={1} className="min-w-0">
+          <Text weight="semibold">{failed ? t('presentr.genFailedTitle') : t('presentr.genEmptyTitle')}</Text>
+          <Text color="secondary">{note || (failed ? t('presentr.genFailedBody') : t('presentr.genEmptyBody'))}</Text>
+          {!failed && (gen.engine || gen.model) && (
+            <Text variant="caption" color="tertiary">
+              {t('presentr.genByModel', { model: gen.model || gen.engine || '' })}
+            </Text>
+          )}
+        </Stack>
+      </Stack>
+    </Panel>
   );
 }

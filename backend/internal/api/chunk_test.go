@@ -1,0 +1,394 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+
+	"presentr/internal/aigentic"
+	"presentr/internal/extract"
+	"presentr/internal/store"
+)
+
+// fakeAI is an in-process extract.AIExtractor: it records every section read and returns a scripted
+// transcription (or a scripted error on a chosen call), so the api layer's section loop — assembly,
+// progress, resume — is tested without a live AI or the PDF splitter.
+type fakeAI struct {
+	mu    sync.Mutex
+	calls int
+	seen  []string // the filename passed for each call (carries the section label)
+	reply func(call int, filename string) (string, error)
+}
+
+func (f *fakeAI) Extract(_ context.Context, _, filename, _ string, _ []byte) (string, string, string, error) {
+	f.mu.Lock()
+	f.calls++
+	call := f.calls
+	f.seen = append(f.seen, filename)
+	f.mu.Unlock()
+	text, err := f.reply(call, filename)
+	if err != nil {
+		return "", "", "", err
+	}
+	return text, "claude", "claude-sonnet-4-6", nil
+}
+
+func fileDoc(t *testing.T, s *Server, id string) {
+	t.Helper()
+	if _, err := s.docs.AddFile(store.Document{ID: id, Title: "manual.pdf", Kind: "file", Mime: "application/pdf", Author: "ada", ExtractState: "pending"}, bytes.NewReader([]byte("%PDF-1.7")), 100<<20); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func sections(n int) []extract.Section {
+	out := make([]extract.Section, n)
+	for i := range out {
+		out[i] = extract.Section{Label: fmt.Sprintf("page %d", i+1), Mime: "application/pdf", Data: []byte{0x25, 0x50}}
+	}
+	return out
+}
+
+// imageSecs builds n image-track sections (an extracted, downscaled photo per page), as pdfPlan produces
+// them for a PDF that carries both a text layer and embedded images.
+func imageSecs(n int) []extract.Section {
+	out := make([]extract.Section, n)
+	for i := range out {
+		out[i] = extract.Section{Label: fmt.Sprintf("image on page %d", i+1), Mime: "image/jpeg", Data: []byte{0xff, 0xd8}, Track: "image", Page: i + 1}
+	}
+	return out
+}
+
+// The TEXT track is never held hostage by the IMAGE track: a PDF with a readable text layer and embedded
+// images whose text the assistant cannot read (no AI configured) still ends "ready" with the exact text
+// layer, the images named as a disclosed gap — NOT a failed read. This is the core promise of the
+// decoupling: the presence of an unreadable photo never costs the file its text.
+func TestTextLayerReadyEvenWhenImagesUnreadable(t *testing.T) {
+	s := newServer(t)
+	fileDoc(t, s, "mixed")
+
+	plan := extract.Plan{LocalText: "Projector Epson EB-2250U on the lectern", Source: "text-layer", Sections: imageSecs(2)}
+	s.readSections("mixed", "ada", "manual.pdf", plan, nil) // no AI at all
+
+	d, _ := s.docs.Get("mixed")
+	if d.ExtractState != "ready" {
+		t.Fatalf("a text-layer file must be READY even with no AI for its images, got %q (%s)", d.ExtractState, d.ExtractError)
+	}
+	if d.ExtractSource != "text-layer" || !d.ExtractTextLayer {
+		t.Fatalf("with only the text track read, source=%q textLayer=%v, want text-layer/true", d.ExtractSource, d.ExtractTextLayer)
+	}
+	text, _ := s.docs.ExtractText("mixed")
+	if !strings.Contains(text, "Epson EB-2250U") {
+		t.Fatalf("the exact text layer must be stored: %q", text)
+	}
+	if !strings.Contains(text, "could not be read") {
+		t.Fatalf("the unreadable images must be NAMED as a gap, not silently dropped: %q", text)
+	}
+}
+
+// A text-layer file whose image track is INTERRUPTED (the engine drops out) stays "ready" — its text is
+// usable throughout — with the images left incomplete and resumable. A second run picks up exactly the
+// remaining images and completes, without re-reading the ones already read.
+func TestTextLayerStaysReadyAcrossImageInterruption(t *testing.T) {
+	s := newServer(t)
+	fileDoc(t, s, "mixed")
+	plan := extract.Plan{LocalText: "TEXTLAYER-BODY", Source: "text-layer", Sections: imageSecs(4)}
+
+	// First run: image 1 reads, image 2 fails with an engine outage → interruption.
+	first := &fakeAI{reply: func(call int, _ string) (string, error) {
+		if call == 2 {
+			return "", aigentic.ErrUnavailable
+		}
+		return fmt.Sprintf("IMG_%d", call), nil
+	}}
+	s.readSections("mixed", "ada", "manual.pdf", plan, first)
+
+	d, _ := s.docs.Get("mixed")
+	if d.ExtractState != "ready" {
+		t.Fatalf("an interrupted image track must NOT fail a text-layer file; it stays ready, got %q", d.ExtractState)
+	}
+	if d.ExtractSectionsDone != 1 || d.ExtractSectionsTotal != 4 {
+		t.Fatalf("image progress after interruption = %d/%d, want 1/4", d.ExtractSectionsDone, d.ExtractSectionsTotal)
+	}
+	if _, ok := s.docs.ExtractJob("mixed"); !ok {
+		t.Fatal("an interrupted image track must persist a resume job")
+	}
+	text, _ := s.docs.ExtractText("mixed")
+	if !strings.Contains(text, "TEXTLAYER-BODY") {
+		t.Fatalf("the text layer must be usable throughout the interruption: %q", text)
+	}
+
+	// Second run (a resume): the engine is back. Only the 3 remaining images are read.
+	second := &fakeAI{reply: func(call int, _ string) (string, error) { return fmt.Sprintf("RESUMED_%d", call), nil }}
+	s.readSections("mixed", "ada", "manual.pdf", plan, second)
+
+	d, _ = s.docs.Get("mixed")
+	if d.ExtractState != "ready" || d.ExtractSource != "mixed" {
+		t.Fatalf("after resume the read completes as a mixed document, got state=%q source=%q", d.ExtractState, d.ExtractSource)
+	}
+	if second.calls != 3 {
+		t.Fatalf("resume must read only the 3 remaining images, got %d calls", second.calls)
+	}
+	if d.ExtractSectionsTotal != 0 {
+		t.Fatalf("a completed read clears its image counters, got %d/%d", d.ExtractSectionsDone, d.ExtractSectionsTotal)
+	}
+	text, _ = s.docs.ExtractText("mixed")
+	for _, want := range []string{"TEXTLAYER-BODY", "IMG_1", "RESUMED_1", "RESUMED_2", "RESUMED_3", "Image on page"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("assembled text missing %q: %s", want, text)
+		}
+	}
+}
+
+// A large file read in several sections is reassembled into ONE document with ONE text containing every
+// section, labelled as an AI read — the split is invisible at the surface (the pool still holds one item).
+func TestChunkedReadAssemblesEverySection(t *testing.T) {
+	s := newServer(t)
+	fileDoc(t, s, "big")
+	ai := &fakeAI{reply: func(call int, _ string) (string, error) { return fmt.Sprintf("TEXT_OF_SECTION_%d", call), nil }}
+
+	s.readSections("big", "ada", "manual.pdf", extract.Plan{Sections: sections(3)}, ai)
+
+	// The surface shows exactly one document, not three fragments.
+	if got := len(s.docs.List()); got != 1 {
+		t.Fatalf("the split must stay invisible: %d documents, want 1", got)
+	}
+	d, _ := s.docs.Get("big")
+	if d.ExtractState != "ready" || d.ExtractSource != "ai" {
+		t.Fatalf("read = state %q source %q, want ready/ai", d.ExtractState, d.ExtractSource)
+	}
+	if d.ExtractSectionsTotal != 0 || d.ExtractSectionsDone != 0 {
+		t.Fatalf("a finished read clears its section counters, got %d/%d", d.ExtractSectionsDone, d.ExtractSectionsTotal)
+	}
+	text, _ := s.docs.ExtractText("big")
+	for i := 1; i <= 3; i++ {
+		if !strings.Contains(text, fmt.Sprintf("TEXT_OF_SECTION_%d", i)) {
+			t.Fatalf("assembled text is missing section %d: %q", i, text)
+		}
+	}
+	if ai.calls != 3 {
+		t.Fatalf("each of the 3 sections must be read once, got %d calls", ai.calls)
+	}
+	// The resume job is cleared once the read completes.
+	if _, ok := s.docs.ExtractJob("big"); ok {
+		t.Fatal("a completed read must leave no resume job behind")
+	}
+}
+
+// A read interrupted mid-way (the engine drops out) leaves a NAMED, resumable failed state with its
+// progress; a later run CONTINUES from where it stopped rather than re-reading the sections already read.
+func TestChunkedReadResumesAfterInterruption(t *testing.T) {
+	s := newServer(t)
+	fileDoc(t, s, "big")
+
+	// First run: section 1 succeeds, section 2 fails with an engine-unavailable error → interruption.
+	first := &fakeAI{reply: func(call int, _ string) (string, error) {
+		if call == 2 {
+			return "", aigentic.ErrUnavailable
+		}
+		return fmt.Sprintf("SECTION_%d", call), nil
+	}}
+	s.readSections("big", "ada", "manual.pdf", extract.Plan{Sections: sections(4)}, first)
+
+	d, _ := s.docs.Get("big")
+	if d.ExtractState != "failed" || d.ExtractError == "" {
+		t.Fatalf("an interrupted read must be a named failed state, got %+v", d)
+	}
+	if d.ExtractSectionsDone != 1 || d.ExtractSectionsTotal != 4 {
+		t.Fatalf("progress after interruption = %d/%d, want 1/4", d.ExtractSectionsDone, d.ExtractSectionsTotal)
+	}
+	if _, ok := s.docs.ExtractJob("big"); !ok {
+		t.Fatal("an interrupted read must persist a resume job")
+	}
+	if first.calls != 2 {
+		t.Fatalf("the first run should stop at the failing section, got %d calls", first.calls)
+	}
+
+	// Second run (a retry): the engine is back. It must resume — only sections 2..4 are read.
+	second := &fakeAI{reply: func(call int, _ string) (string, error) { return fmt.Sprintf("RESUMED_%d", call), nil }}
+	s.readSections("big", "ada", "manual.pdf", extract.Plan{Sections: sections(4)}, second)
+
+	d, _ = s.docs.Get("big")
+	if d.ExtractState != "ready" {
+		t.Fatalf("after resume the read must complete, got %q", d.ExtractState)
+	}
+	if second.calls != 3 {
+		t.Fatalf("resume must read only the 3 remaining sections, got %d calls (not from the start)", second.calls)
+	}
+	text, _ := s.docs.ExtractText("big")
+	if !strings.Contains(text, "SECTION_1") {
+		t.Fatalf("the section read before the interruption must survive the resume: %q", text)
+	}
+	for _, want := range []string{"RESUMED_1", "RESUMED_2", "RESUMED_3"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("resumed sections missing from assembled text: %q", text)
+		}
+	}
+}
+
+// A section that is structurally too slow (it keeps timing out) is tried a BOUNDED number of times, then
+// named as unread and SKIPPED — the read must NOT loop on it forever, and the sections around it must
+// still be read and the document reach "ready".
+func TestChunkedReadSkipsStructurallySlowSection(t *testing.T) {
+	s := newServer(t)
+	fileDoc(t, s, "big")
+
+	slowCalls := 0
+	ai := &fakeAI{reply: func(_ int, filename string) (string, error) {
+		if strings.Contains(filename, "page 2") {
+			slowCalls++
+			return "", context.DeadlineExceeded // this one page never finishes in time
+		}
+		return "TEXT_" + filename, nil
+	}}
+	s.readSections("big", "ada", "manual.pdf", extract.Plan{Sections: sections(3)}, ai)
+
+	d, _ := s.docs.Get("big")
+	if d.ExtractState != "ready" {
+		t.Fatalf("a structurally-slow section must not block the whole read; state=%q err=%q", d.ExtractState, d.ExtractError)
+	}
+	if slowCalls != maxSectionAttempts {
+		t.Fatalf("the slow section must be tried exactly %d times (bounded), got %d", maxSectionAttempts, slowCalls)
+	}
+	text, _ := s.docs.ExtractText("big")
+	if !strings.Contains(text, "page 1") || !strings.Contains(text, "page 3") {
+		t.Fatalf("the sections around the slow one must still be read: %q", text)
+	}
+	if !strings.Contains(text, "could not be read") {
+		t.Fatalf("the skipped section must be NAMED as unread in the assembled text: %q", text)
+	}
+	if _, ok := s.docs.ExtractJob("big"); ok {
+		t.Fatal("a completed read must leave no resume job")
+	}
+}
+
+// A timeout counts against the section's attempt budget across a RESUME, so a user who keeps retrying a
+// structurally-slow section does not reset the escalation each time — it converges on the skip instead of
+// re-trying from the short deadline forever.
+func TestChunkedReadTimeoutAttemptsCarryAcrossResume(t *testing.T) {
+	s := newServer(t)
+	fileDoc(t, s, "big")
+
+	// Every run: section 1 reads, section 2 times out. With maxSectionAttempts==2 the FIRST run spends both
+	// attempts on section 2 in-process, then skips it — so a single run already reaches "ready".
+	slow := &fakeAI{reply: func(_ int, filename string) (string, error) {
+		if strings.Contains(filename, "page 2") {
+			return "", context.DeadlineExceeded
+		}
+		return "OK_" + filename, nil
+	}}
+	s.readSections("big", "ada", "manual.pdf", extract.Plan{Sections: sections(2)}, slow)
+
+	d, _ := s.docs.Get("big")
+	if d.ExtractState != "ready" {
+		t.Fatalf("the read must converge on ready after the slow section is abandoned, got %q", d.ExtractState)
+	}
+	text, _ := s.docs.ExtractText("big")
+	if !strings.Contains(text, "OK_") || !strings.Contains(text, "could not be read") {
+		t.Fatalf("the read section must survive and the slow one be named: %q", text)
+	}
+}
+
+// End to end: a text-layer PDF with several embedded photos uploaded to the pool is planned into two
+// tracks — the text layer read EXACTLY and locally (no AI), and each image read on its own by aigentic —
+// then assembled into ONE ready document. This exercises Prepare + extractImageSections + the section
+// loop together, and proves the text needs no AI while the images do.
+func TestUploadOfImagePDFReadsBothTracksEndToEnd(t *testing.T) {
+	var calls int
+	var mu sync.Mutex
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		_, _ = io.Copy(io.Discard, r.Body)
+		fmt.Fprintf(w, `{"data":{"output":"image-text-%d","engine":"claude","model":"claude-sonnet-4-6"}}`, n)
+	}))
+	defer stub.Close()
+
+	s := newServer(t)
+	s.ai = aigentic.New(stub.URL, "sekret")
+
+	pdf := imageBearingMultiPagePDF(t, 4)
+	if _, err := s.docs.AddFile(store.Document{ID: "manual", Title: "room.pdf", Kind: "file", Mime: "application/pdf", Author: "ada", ExtractState: "pending"}, bytes.NewReader(pdf), 100<<20); err != nil {
+		t.Fatal(err)
+	}
+	s.runExtraction("manual")
+
+	if got := len(s.docs.List()); got != 1 {
+		t.Fatalf("the pool must hold one document, got %d", got)
+	}
+	d, _ := s.docs.Get("manual")
+	if d.ExtractState != "ready" {
+		t.Fatalf("end-to-end read = %+v, want ready", d)
+	}
+	if d.ExtractSource != "mixed" || !d.ExtractTextLayer {
+		t.Fatalf("a text+image PDF must read as a mixed, text-layer-bearing document: source=%q textLayer=%v", d.ExtractSource, d.ExtractTextLayer)
+	}
+	if calls != 4 {
+		t.Fatalf("each of the 4 images must be read once by the AI, got %d calls", calls)
+	}
+	text, _ := s.docs.ExtractText("manual")
+	if !strings.Contains(text, "PAGE_0") || !strings.Contains(text, "PAGE_3") {
+		t.Fatalf("the text layer must be read locally into the extract: %q", text)
+	}
+	if !strings.Contains(text, "image-text-1") || !strings.Contains(text, "Image on page 1") {
+		t.Fatalf("each image's recognized text must be included and page-labelled: %q", text)
+	}
+}
+
+// imageBearingMultiPagePDF builds a classic multi-page PDF with a readable text layer ("PAGE_i") and a
+// DISTINCT decodable image on each page (a 1×1 DeviceGray raster in its own object), so the two-track
+// read finds one image per page to send to the AI. The content stream is written BEFORE its page's image
+// so the text reader is not fooled by an adjacent /Image marker.
+func imageBearingMultiPagePDF(t *testing.T, n int) []byte {
+	t.Helper()
+	var objs [][]byte
+	add := func(s string) int { objs = append(objs, []byte(s)); return len(objs) }
+	addStream := func(dict, stream string) int {
+		var b bytes.Buffer
+		b.WriteString(dict[:len(dict)-2])
+		fmt.Fprintf(&b, " /Length %d >>\nstream\n%s\nendstream", len(stream), stream)
+		objs = append(objs, b.Bytes())
+		return len(objs)
+	}
+	_ = add("<< /Type /Catalog /Pages 2 0 R >>")
+	pagesIdx := add("")
+	fontIdx := add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+	var pages []int
+	for i := 0; i < n; i++ {
+		content := fmt.Sprintf("BT /F1 12 Tf 72 720 Td (PAGE_%d) Tj ET", i)
+		cIdx := addStream("<< >>", content)
+		imgIdx := addStream("<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 >>", "\x00")
+		pIdx := add(fmt.Sprintf("<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 %d 0 R >> /XObject << /Im0 %d 0 R >> >> /MediaBox [0 0 612 792] /Contents %d 0 R >>", fontIdx, imgIdx, cIdx))
+		pages = append(pages, pIdx)
+	}
+	var kids strings.Builder
+	for i, p := range pages {
+		if i > 0 {
+			kids.WriteByte(' ')
+		}
+		fmt.Fprintf(&kids, "%d 0 R", p)
+	}
+	objs[pagesIdx-1] = []byte(fmt.Sprintf("<< /Type /Pages /Kids [ %s ] /Count %d >>", kids.String(), n))
+
+	var buf bytes.Buffer
+	buf.WriteString("%PDF-1.4\n")
+	offs := make([]int, len(objs)+1)
+	for i, body := range objs {
+		offs[i+1] = buf.Len()
+		fmt.Fprintf(&buf, "%d 0 obj\n%s\nendobj\n", i+1, body)
+	}
+	x := buf.Len()
+	fmt.Fprintf(&buf, "xref\n0 %d\n0000000000 65535 f \n", len(objs)+1)
+	for i := 1; i <= len(objs); i++ {
+		fmt.Fprintf(&buf, "%010d 00000 n \n", offs[i])
+	}
+	fmt.Fprintf(&buf, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF", len(objs)+1, x)
+	return buf.Bytes()
+}

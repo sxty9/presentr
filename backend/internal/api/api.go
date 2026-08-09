@@ -13,8 +13,11 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"presentr/internal/aigentic"
 	"presentr/internal/auth"
 	"presentr/internal/rights"
 	"presentr/internal/store"
@@ -40,6 +43,7 @@ const (
 	maxIDLen   = 64    // clamp a client-supplied id
 	maxKeyLen  = 128   // clamp the source fingerprint
 	maxCoord   = 20000 // clamp a canvas coordinate
+	maxNoteLen = 2000  // clamp the assistant's generation note (why nothing was concluded / a failure)
 )
 
 // Server wires the session verifier and presentr's passive pools into HTTP handlers. The document
@@ -50,12 +54,52 @@ type Server struct {
 	docs    store.DocStore
 	chats   *store.ChatPool
 	diagram *store.DiagramPool
+	ai      *aigentic.Client // the room's AI, reached on the caller's behalf; nil/disabled => /ask 503s
+	// extractSem bounds how many uploaded files are read (text-layer parse or AI recognition) at once,
+	// so a burst of large uploads cannot spawn unbounded background work. Buffered in New.
+	extractSem chan struct{}
+	// extractWG tracks in-flight background reads so they can be drained (a graceful stop, and a
+	// deterministic test that must not race a temp-dir cleanup).
+	extractWG sync.WaitGroup
+	// aiLimit caches aigentic's published per-request byte ceiling (0 ⇒ not learned; the fallback floor
+	// is used). It is the boundary presentr ASKS aigentic for rather than guessing (RefreshRequestLimit),
+	// and it sizes the sections a large file is split into. A test may set it to force small sections.
+	aiLimit atomic.Int64
+
+	// askMu guards the in-memory registry of background ask jobs. An /ask turn no longer runs inside its
+	// HTTP request (a grounded turn over a large pool can outlast Cloudflare's ~100s edge limit and land
+	// a 524 in the browser); it runs as a background job the UI polls for granular progress. Jobs are
+	// transient — a browser that reloads simply asks again — so they live in memory, not the pool.
+	askMu   sync.Mutex
+	askJobs map[string]*askJob
+	// askWG tracks in-flight ask jobs so a test (or a graceful stop) can drain them deterministically.
+	askWG sync.WaitGroup
+
+	// refMu guards refs: the put-once/reference-many cache. After aigentic reads a document/image once it
+	// returns a reference to the bytes it now holds; presentr remembers it here (keyed by the document/
+	// image) so the NEXT turn sends only the reference, not the full bytes again. Held in memory only: a
+	// reference must never outlive the bytes aigentic holds, so a restart re-sends bytes rather than
+	// trusting a possibly-evicted reference. Invalidated when a document is deleted or re-read.
+	refMu sync.Mutex
+	refs  map[string]string
 }
 
+// maxConcurrentExtractions caps parallel background reads (see extractSem).
+const maxConcurrentExtractions = 4
+
 // New builds a server over the session verifier and the pools (the single access points to the
-// room's knowledge, its connection diagram and the users' conversations with the assistant).
-func New(v *auth.Verifier, docs store.DocStore, chats *store.ChatPool, diagram *store.DiagramPool) *Server {
-	return &Server{v: v, docs: docs, chats: chats, diagram: diagram}
+// room's knowledge, its connection diagram and the users' conversations with the assistant). ai is
+// the client for the room's AI (aigentic); a nil or unconfigured client leaves /ask reporting the
+// assistant as unavailable, and the UI degrades gracefully. The same client also reads text out of
+// uploaded images and scans (see extract.go); when it is absent, those reads fail with a named,
+// retriable reason rather than blocking the daemon.
+func New(v *auth.Verifier, docs store.DocStore, chats *store.ChatPool, diagram *store.DiagramPool, ai *aigentic.Client) *Server {
+	return &Server{
+		v: v, docs: docs, chats: chats, diagram: diagram, ai: ai,
+		extractSem: make(chan struct{}, maxConcurrentExtractions),
+		askJobs:    map[string]*askJob{},
+		refs:       map[string]string{},
+	}
 }
 
 type handler func(w http.ResponseWriter, r *http.Request, u *auth.User)
@@ -69,8 +113,19 @@ func (s *Server) Handler() http.Handler {
 	// The document pool (workflow stage 1). Reading and writing both require the presentr
 	// right; writes additionally carry the CSRF double-submit guard.
 	mux.HandleFunc("GET "+base+"docs", s.guard(rights.GroupUse, false, s.listDocs))
+	// POST docs is the ONE way into the pool for BOTH kinds of knowledge: a JSON body writes a typed
+	// text document; a multipart body uploads one or more files. addDoc routes on the content type,
+	// so the two are one access point, not similar siblings.
 	mux.HandleFunc("POST "+base+"docs", s.guard(rights.GroupUse, true, s.addDoc))
 	mux.HandleFunc("GET "+base+"docs/{id}", s.guard(rights.GroupUse, false, s.getDoc))
+	// The raw bytes of a file document, for the SDK viewers (image/PDF preview). Read-only.
+	mux.HandleFunc("GET "+base+"docs/{id}/raw", s.guard(rights.GroupUse, false, s.getRaw))
+	// The derived text read out of a file document (the extract), for the UI to show what the assistant
+	// will actually read. Read-only.
+	mux.HandleFunc("GET "+base+"docs/{id}/extract", s.guard(rights.GroupUse, false, s.getExtract))
+	// Re-run the text read of a file document without re-uploading it — for a read that failed
+	// (no AI, a broken file) once the cause is cleared. Right-gated + CSRF (it spends AI budget).
+	mux.HandleFunc("POST "+base+"docs/{id}/extract", s.guard(rights.GroupUse, true, s.reExtract))
 	mux.HandleFunc("DELETE "+base+"docs/{id}", s.guard(rights.GroupUse, true, s.deleteDoc))
 
 	// The room assistant's conversation (workflow stage 3), persisted per user so a reload lands
@@ -78,6 +133,14 @@ func (s *Server) Handler() http.Handler {
 	// transcript. GET reads the caller's conversation; PUT replaces it (CSRF on the write).
 	mux.HandleFunc("GET "+base+"chats", s.guard(rights.GroupUse, false, s.getChats))
 	mux.HandleFunc("PUT "+base+"chats", s.guard(rights.GroupUse, true, s.putChats))
+
+	// The room's AI — the ONE server-side access point that grounds an AI turn in the whole document
+	// pool (text AND uploaded files) and forwards it to aigentic on the caller's behalf. Both the
+	// Chat tab and the Connection diagram derive from it. Right-gated + CSRF (it spends AI budget).
+	mux.HandleFunc("POST "+base+"ask", s.guard(rights.GroupUse, true, s.ask))
+	// Poll one background ask job for granular progress and, once done, its answer. Read-only (no
+	// CSRF); scoped to the caller who started it.
+	mux.HandleFunc("GET "+base+"ask/{id}", s.guard(rights.GroupUse, false, s.askStatus))
 
 	// The connection diagram (workflow stage 2). GET reads the current graph + whether it is the
 	// document-derived state or manually modified. PUT replaces the current graph (a manual edit).
@@ -151,10 +214,15 @@ func (s *Server) getDoc(w http.ResponseWriter, r *http.Request, _ *auth.User) {
 	writeJSON(w, http.StatusOK, d)
 }
 
-// addDoc appends a text document to the shared room pool. Identity, kind, size and creation time
-// are stamped HERE, outside the passive pool — every such evaluation lives in this layer. The
-// append is atomic: it lands whole or leaves the pool untouched.
+// addDoc grows the shared room pool. A multipart body is a file upload (handled in files.go); a
+// JSON body is a typed text document, appended here. Either way identity, kind, mime, size and
+// creation time are stamped HERE, outside the passive pool — every such evaluation lives in this
+// layer — and the write is atomic: it lands whole or leaves the pool untouched.
 func (s *Server) addDoc(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		s.uploadFiles(w, r, u)
+		return
+	}
 	var body struct {
 		Title       string `json:"title"`
 		Content     string `json:"content"`
@@ -196,10 +264,14 @@ func (s *Server) addDoc(w http.ResponseWriter, r *http.Request, u *auth.User) {
 // deleteDoc removes a document from the room pool. Idempotent: deleting a missing id still
 // reports success, so the UI converges on the same state either way.
 func (s *Server) deleteDoc(w http.ResponseWriter, r *http.Request, _ *auth.User) {
-	if err := s.docs.Delete(r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	if err := s.docs.Delete(id); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not delete the document")
 		return
 	}
+	// The bytes aigentic held for this document are gone; drop any remembered references so a later turn
+	// re-sends fresh content rather than pointing at a deleted document (put-once invalidation).
+	s.invalidateRefs(id)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -272,6 +344,15 @@ func diagramView(st store.DiagramSnapshot) map[string]any {
 		"modified":  st.Modified,
 		"sourceKey": st.SourceKey,
 		"generated": st.Generated,
+		// The last generate attempt's outcome, so the UI can show a STANDING banner (persistent, not a
+		// vanishing toast) — including the assistant's own reason when it concluded no connections.
+		"generation": map[string]any{
+			"state":  st.Generation.State,
+			"note":   st.Generation.Note,
+			"model":  st.Generation.Model,
+			"engine": st.Generation.Engine,
+			"at":     st.Generation.At,
+		},
 	}
 }
 
@@ -300,30 +381,67 @@ func (s *Server) putDiagram(w http.ResponseWriter, r *http.Request, _ *auth.User
 	writeJSON(w, http.StatusOK, diagramView(s.diagram.Get()))
 }
 
-// generateDiagram installs a freshly derived baseline. The UI runs the aigentic investigation of the
-// documents (the "Ask AI" standard, session-forwarded) and posts the resulting graph plus a
-// fingerprint of the documents it came from. The baseline (Doc) is always replaced; the visible
-// graph (Current) is replaced too, but only while the user has NOT manually modified it — so a
-// hand-drawn layout is never overwritten behind the user's back (it stays reachable via restore).
+// generateDiagram records the OUTCOME of a "generate from documents" attempt. The UI runs the aigentic
+// investigation of the documents (the "Ask AI" standard, session-forwarded) and reports one of three
+// outcomes here, so the result is stored on the shared diagram and PERSISTS across reloads (not a
+// vanishing toast):
+//
+//   - "ok": a graph was derived. The baseline (Doc) is replaced; the visible graph (Current) is replaced
+//     too, but only while the user has NOT manually modified it — so a hand-drawn layout is never
+//     overwritten behind the user's back (it stays reachable via restore). The generation is stamped ok
+//     with the model that produced it (Kennzeichnungspflicht).
+//   - "empty": the assistant concluded NO connections. The graph is left untouched (a prior diagram is
+//     not wiped by a fruitless attempt); the assistant's own explanation is stored as the note, so the
+//     user is told WHY rather than left with a silent, endless spinner (Kein stummes Ausbleiben).
+//   - "failed": the turn could not complete (timeout, no engine). The graph is left untouched; the reason
+//     is stored as the note.
 func (s *Server) generateDiagram(w http.ResponseWriter, r *http.Request, _ *auth.User) {
 	var body struct {
+		State     string     `json:"state"`
 		Nodes     []jsonNode `json:"nodes"`
 		Edges     []jsonEdge `json:"edges"`
 		SourceKey string     `json:"sourceKey"`
+		Note      string     `json:"note"`
+		Model     string     `json:"model"`
+		Engine    string     `json:"engine"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxDiagramBody)).Decode(&body); err != nil && err != io.EOF {
 		writeErr(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 	g := sanitizeGraph(body.Nodes, body.Edges)
+	// The outcome is derived here, not trusted verbatim: "ok" requires an actual graph, so a client that
+	// mislabels an empty result as ok still records honestly (the pool/api layer owns every judgement).
+	state := strings.TrimSpace(body.State)
+	if state == "" {
+		state = "ok" // backward-compatible default for a caller that posts only a graph
+	}
+	if state == "ok" && len(g.Nodes) == 0 {
+		state = "empty"
+	}
+	gen := store.Generation{
+		Note:   clip(body.Note, maxNoteLen),
+		Model:  clip(body.Model, maxLabelLen),
+		Engine: clip(body.Engine, maxLabelLen),
+		At:     time.Now().Unix(),
+	}
 	key := clip(body.SourceKey, maxKeyLen)
 	err := s.diagram.Update(func(st *store.DiagramSnapshot) {
-		st.Doc = g
-		st.SourceKey = key
-		st.Generated = time.Now().Unix()
-		if !st.Modified {
-			st.Current = store.CloneGraph(g)
+		switch state {
+		case "ok":
+			st.Doc = g
+			st.SourceKey = key
+			st.Generated = time.Now().Unix()
+			if !st.Modified {
+				st.Current = store.CloneGraph(g)
+			}
+			gen.State = "ok"
+		case "failed":
+			gen.State = "failed"
+		default:
+			gen.State = "empty"
 		}
+		st.Generation = gen
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not save the diagram")

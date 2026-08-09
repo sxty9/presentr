@@ -21,8 +21,10 @@ package store
 import "C"
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,8 +32,16 @@ import (
 	"unsafe"
 )
 
-// docPrefix is the folder under which every document lives in the scheme tree.
-const docPrefix = "documents"
+// docPrefix is the folder under which every document's metadata lives in the scheme tree; blobPrefix
+// holds the raw bytes of file documents, one node per document (kept out of the metadata a List
+// walks — Portionierte Daten). Both live in the same store, reached through this one access point.
+const (
+	docPrefix     = "documents"
+	blobPrefix    = "blobs"
+	extractPrefix = "extracts"       // the derived extract text of a file document, one node per document
+	imagePrefix   = "extract-images" // the compressed images read out of a file document (JSON), one node per document
+	jobPrefix     = "extract-jobs"   // an in-progress chunked-read job, so a large read resumes after a crash
+)
 
 // NewDocStore returns the scheme-backed document backend (selected because this file's `scheme`
 // build tag is active). The store lives in a "scheme" subdirectory of the service's data dir.
@@ -95,7 +105,83 @@ func (s *SchemeDocs) Add(d Document) error {
 	path := docPrefix + "/" + d.ID
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.putLocked(path, desc, data)
+}
 
+// AddFile stores a file document as two described nodes: its raw bytes at blobs/<id> and its
+// metadata at documents/<id>. The bytes are written FIRST, so the document only becomes observable
+// (in List/Get) once the metadata node exists — a reader never sees a file entry whose bytes are
+// missing (Atomare Zugriffe). The metadata carries no inline bytes; Bytes reaches the blob node.
+// d.Size is stamped from the bytes actually stored. Unlike the JSON pool, scheme's FFI takes a whole
+// buffer per node, so the bytes are drained into memory here (bounded by max) before the put — a
+// 100 MB upload transiently costs ~100 MB of memory on the scheme backend; the pure-Go pool streams.
+func (s *SchemeDocs) AddFile(d Document, src io.Reader, max int64) (int64, error) {
+	data, err := io.ReadAll(io.LimitReader(src, max+1))
+	if err != nil {
+		return 0, err
+	}
+	if int64(len(data)) > max {
+		return 0, ErrFileTooLarge
+	}
+	d.Size = int64(len(data))
+	meta, err := json.Marshal(d)
+	if err != nil {
+		return 0, err
+	}
+	desc := strings.TrimSpace(d.Description)
+	if desc == "" {
+		desc = strings.TrimSpace(d.Title)
+	}
+	if desc == "" {
+		desc = "(no description)"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.putLocked(blobPrefix+"/"+d.ID, desc, data); err != nil {
+		return 0, err
+	}
+	if err := s.putLocked(docPrefix+"/"+d.ID, desc, meta); err != nil {
+		return 0, err
+	}
+	return d.Size, nil
+}
+
+// Bytes returns the raw bytes of a file document (its blobs/<id> node). Absence (a text document or
+// an unknown id) reports found=false.
+func (s *SchemeDocs) Bytes(id string) ([]byte, bool) {
+	if id == "" {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok, err := s.getBytes(blobPrefix + "/" + id)
+	if err != nil || !ok {
+		return nil, false
+	}
+	return b, true
+}
+
+// OpenBlob returns a seekable reader over a file document's bytes plus its size, for streaming to a
+// client. scheme's FFI hands back a whole buffer (no partial reads), so the bytes are read into
+// memory and wrapped in a bytes.Reader; the pure-Go pool serves straight from the file instead. A
+// missing blob reports found=false.
+func (s *SchemeDocs) OpenBlob(id string) (io.ReadSeekCloser, int64, bool) {
+	b, ok := s.Bytes(id)
+	if !ok {
+		return nil, 0, false
+	}
+	return nopSeekCloser{bytes.NewReader(b)}, int64(len(b)), true
+}
+
+// nopSeekCloser adapts a *bytes.Reader (a ReadSeeker) to the ReadSeekCloser OpenBlob returns; the
+// in-memory reader needs no close.
+type nopSeekCloser struct{ *bytes.Reader }
+
+func (nopSeekCloser) Close() error { return nil }
+
+// putLocked writes one described node at path (caller holds s.mu). scheme requires a non-empty
+// description on every node, so desc must already be non-empty.
+func (s *SchemeDocs) putLocked(path, desc string, data []byte) error {
 	cpath := C.CBytes([]byte(path))
 	defer C.free(cpath)
 	cdesc := C.CBytes([]byte(desc))
@@ -154,11 +240,194 @@ func (s *SchemeDocs) List() []Document {
 	return out
 }
 
-// Delete removes a document. scheme delete is idempotent — a missing id is not an error.
-func (s *SchemeDocs) Delete(id string) error {
-	path := docPrefix + "/" + id
+// SetExtract records a file document's derived text as a second described node at extracts/<id> and
+// stamps the small state/provenance fields onto the metadata node — the same entity reached through
+// this one access point, never a parallel store. For a "ready" extract the text node is written FIRST,
+// then the metadata is flipped, so a reader never sees state "ready" without the text behind it. A
+// "pending" or "failed" extract updates only the metadata (any prior text node is left intact, so a
+// re-read never destroys the last good one). An unknown id is a no-op (the document was deleted
+// mid-read). scheme's FFI takes a whole buffer, so an extract — being text, far smaller than the
+// source file — is a modest, bounded write here.
+func (s *SchemeDocs) SetExtract(id string, ex Extract) error {
+	if id == "" {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	b, ok, err := s.getBytes(docPrefix + "/" + id)
+	if err != nil || !ok {
+		return err // gone (or unreadable) → no-op; the extract for an absent document is discarded
+	}
+	var d Document
+	if json.Unmarshal(b, &d) != nil {
+		return nil
+	}
+	desc := strings.TrimSpace(d.Description)
+	if desc == "" {
+		desc = strings.TrimSpace(d.Title)
+	}
+	if desc == "" {
+		desc = "(no description)"
+	}
+	if ex.State == "ready" {
+		if err := s.putLocked(extractPrefix+"/"+id, desc, []byte(ex.Text)); err != nil {
+			return err
+		}
+	}
+	switch ex.State {
+	case "pending":
+		d.ExtractState = "pending"
+		d.ExtractTextLayer = false
+		d.ExtractSectionsDone, d.ExtractSectionsTotal = 0, 0
+		d.ExtractSectionLabel = ""
+		d.ExtractSectionPhase = ""
+	case "reading":
+		d.ExtractState = "reading"
+		d.ExtractTextLayer = ex.TextLayer
+		d.ExtractSectionsDone = ex.SectionsDone
+		d.ExtractSectionsTotal = ex.SectionsTotal
+		d.ExtractSectionLabel = ex.SectionLabel
+		d.ExtractSectionPhase = ex.SectionPhase
+	case "ready":
+		d.ExtractState = "ready"
+		d.ExtractSource = ex.Source
+		d.ExtractModel = ex.Model
+		d.ExtractEngine = ex.Engine
+		d.ExtractError = ""
+		d.ExtractSize = int64(len(ex.Text))
+		d.ExtractedAt = ex.At
+		d.ExtractTextLayer = ex.TextLayer
+		d.ExtractSectionsDone, d.ExtractSectionsTotal = ex.SectionsDone, ex.SectionsTotal
+		d.ExtractSectionLabel = ex.SectionLabel
+		d.ExtractSectionPhase = ex.SectionPhase
+	case "failed":
+		d.ExtractState = "failed"
+		d.ExtractError = ex.Error
+		d.ExtractedAt = ex.At
+		d.ExtractTextLayer = ex.TextLayer
+		d.ExtractSectionPhase = ""
+		if ex.SectionsTotal > 0 {
+			d.ExtractSectionsDone, d.ExtractSectionsTotal = ex.SectionsDone, ex.SectionsTotal
+			d.ExtractSectionLabel = ex.SectionLabel
+		}
+	default:
+		return nil
+	}
+	meta, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+	if err := s.putLocked(docPrefix+"/"+id, desc, meta); err != nil {
+		return err
+	}
+	// A completed read drops its resume job; a "ready" read whose image track is still running keeps it.
+	if ex.State == "ready" && ex.SectionsDone >= ex.SectionsTotal {
+		_ = s.deleteLocked(jobPrefix + "/" + id)
+	}
+	return nil
+}
+
+// SetExtractJob stores the in-progress chunked-read job as a described node beside the extract, so a
+// large read resumes rather than restarting after a crash or engine outage. The same entity through the
+// one access point (no second store).
+func (s *SchemeDocs) SetExtractJob(id string, job []byte) error {
+	if id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.putLocked(jobPrefix+"/"+id, "extract-read-job", job)
+}
+
+// ExtractJob returns a document's persisted chunked-read job, and whether one is present.
+func (s *SchemeDocs) ExtractJob(id string) ([]byte, bool) {
+	if id == "" {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok, err := s.getBytes(jobPrefix + "/" + id)
+	if err != nil || !ok {
+		return nil, false
+	}
+	return b, true
+}
+
+// SetExtractImages stores the compressed images read out of a file document as a described node at
+// extract-images/<id> (their JSON encoding), beside the extract text as part of the SAME entity — never
+// a parallel store. An empty slice deletes the node (a fresh read starts with none). scheme's FFI takes
+// a whole buffer; the images are compact (downscaled JPEGs), so this is a modest, bounded write.
+func (s *SchemeDocs) SetExtractImages(id string, imgs []ExtractImage) error {
+	if id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(imgs) == 0 {
+		return s.deleteLocked(imagePrefix + "/" + id)
+	}
+	b, err := json.Marshal(imgs)
+	if err != nil {
+		return err
+	}
+	return s.putLocked(imagePrefix+"/"+id, "extract-images", b)
+}
+
+// ExtractImages returns the compressed images read out of a file document, and whether any are present.
+func (s *SchemeDocs) ExtractImages(id string) ([]ExtractImage, bool) {
+	if id == "" {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok, err := s.getBytes(imagePrefix + "/" + id)
+	if err != nil || !ok {
+		return nil, false
+	}
+	var imgs []ExtractImage
+	if json.Unmarshal(b, &imgs) != nil || len(imgs) == 0 {
+		return nil, false
+	}
+	return imgs, true
+}
+
+// ExtractText returns a file document's derived text (its extracts/<id> node), and whether present.
+func (s *SchemeDocs) ExtractText(id string) (string, bool) {
+	if id == "" {
+		return "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok, err := s.getBytes(extractPrefix + "/" + id)
+	if err != nil || !ok {
+		return "", false
+	}
+	return string(b), true
+}
+
+// Delete removes a document: its metadata node first (making it invisible), then its blob and extract
+// nodes. scheme delete is idempotent — a missing node is not an error, so a text document (no blob),
+// a file with no extract yet, and a crash between the deletes all resolve cleanly.
+func (s *SchemeDocs) Delete(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.deleteLocked(docPrefix + "/" + id); err != nil {
+		return err
+	}
+	if err := s.deleteLocked(blobPrefix + "/" + id); err != nil {
+		return err
+	}
+	if err := s.deleteLocked(extractPrefix + "/" + id); err != nil {
+		return err
+	}
+	if err := s.deleteLocked(imagePrefix + "/" + id); err != nil {
+		return err
+	}
+	return s.deleteLocked(jobPrefix + "/" + id)
+}
+
+// deleteLocked removes one node at path (caller holds s.mu). Idempotent.
+func (s *SchemeDocs) deleteLocked(path string) error {
 	cpath := C.CBytes([]byte(path))
 	defer C.free(cpath)
 	if st := C.scheme_delete(s.h, (*C.char)(cpath), C.size_t(len(path)), nil); st != C.SCHEME_OK {
