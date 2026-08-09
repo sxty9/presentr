@@ -10,6 +10,7 @@ package api
 // behalf. The pool stays passive: it returns bytes; this layer decides what becomes context.
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -18,10 +19,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"presentr/internal/aigentic"
 	"presentr/internal/auth"
 	"presentr/internal/extract"
+	"presentr/internal/store"
 )
 
 // groundingImageMime is the media type every read-out image is grounded as (ExtractImages compresses
@@ -36,9 +39,45 @@ const (
 	maxGroundingBytes = 24 << 20
 )
 
-// ask runs one AI turn for the caller, grounded in the whole document pool, and returns the model's
-// answer labelled with the engine/model that produced it (Kennzeichnungspflicht). The prompt and the
-// requested answer shape come from the UI; the grounding is assembled here.
+// ask job states and phases. State is the coarse lifecycle; phase names the fine, page-related step the
+// UI shows instead of a bare spinner (grounding assembled → sent to the assistant → answer received).
+const (
+	askStateRunning = "running"
+	askStateDone    = "done"
+	askStateFailed  = "failed"
+
+	askPhaseGrounding = "grounding" // assembling the room context
+	askPhaseSending   = "sending"   // context ready, the turn is at aigentic awaiting an answer
+	askPhaseDone      = "done"      // the answer is back
+)
+
+// askJobTTL is how long a finished ask job stays pollable before it is reaped, so a client that polls a
+// little after completion still reads the answer while memory stays bounded.
+const askJobTTL = 10 * time.Minute
+
+// askJob is one background AI turn. It lives in memory (the answer is transient — a browser reload just
+// asks again), keyed by an unguessable id and scoped to the user who started it. Phase/Docs/Images drive
+// the UI's granular progress; Output/Model/Engine hold the answer; Error holds a clean failure reason.
+type askJob struct {
+	ID     string
+	Owner  string
+	State  string
+	Phase  string
+	Docs   int
+	Images int
+	Output string
+	Model  string
+	Engine string
+	Error  string
+	Done   int64 // epoch seconds the job reached a terminal state (0 while running), for reaping
+}
+
+// ask starts one AI turn for the caller as a BACKGROUND job and returns its id at once. The turn no
+// longer runs inside this HTTP request: a grounded turn over a large pool can take longer than
+// Cloudflare's ~100s edge limit, which would return a 524 HTML page to the browser instead of an answer.
+// Running it in the background (on context.Background(), so a browser reload cannot abort it — the same
+// pattern as a file read in extract.go) lets the UI poll askStatus for granular progress and, when it is
+// ready, the answer. The prompt and requested shape come from the UI; the grounding is assembled here.
 func (s *Server) ask(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	if s.ai == nil || !s.ai.Enabled() {
 		writeErr(w, http.StatusServiceUnavailable, "The room assistant is not configured on this server")
@@ -57,36 +96,258 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request, u *auth.User) {
 		writeErr(w, http.StatusBadRequest, "A prompt is required")
 		return
 	}
-
-	inline, gaps := s.roomGrounding(prompt)
-	// The grounding is not the whole pool: some documents were too large to include, and some files have
-	// not been read yet or could not be read. Rather than let the model answer as if it had seen everything
-	// (a silent, dishonest gap), tell it plainly what it did NOT receive (EHRLICH BLEIBEN).
-	inline = withGroundingNote(inline, groundingNote(gaps))
 	format := askFormat(body.OutputFormat)
 
-	res, err := s.ai.Run(r.Context(), u.Username, aigentic.Req{Prompt: prompt, OutputFormat: format, Inline: inline})
-	if errors.Is(err, aigentic.ErrNoVisionEngine) {
-		// The grounding carried room images but no engine reachable here can SEE images (only a local
-		// text-only model is available). Rather than fail the whole answer, retry WITHOUT the images: the
-		// text grounding still stands, and a note tells the model the pictures could not be shown, so the
-		// assistant answers from text and names what it could not see (kein stummes Ausbleiben) — instead of
-		// a room with a text-only engine losing its assistant entirely the moment it holds one image.
-		textOnly := withGroundingNote(dropImageParts(inline), visionUnavailableNote)
-		res, err = s.ai.Run(r.Context(), u.Username, aigentic.Req{Prompt: prompt, OutputFormat: format, Inline: textOnly})
+	job := &askJob{ID: store.NewID(), Owner: u.Username, State: askStateRunning, Phase: askPhaseGrounding}
+	s.askMu.Lock()
+	s.reapAskJobsLocked()
+	s.askJobs[job.ID] = job
+	s.askMu.Unlock()
+
+	s.askWG.Add(1)
+	go func() {
+		defer s.askWG.Done()
+		s.runAsk(job.ID, u.Username, prompt, format)
+	}()
+
+	writeJSON(w, http.StatusAccepted, map[string]any{"jobId": job.ID, "state": askStateRunning, "phase": askPhaseGrounding})
+}
+
+// askStatus reports one ask job's progress and, once it is done, its answer (Kennzeichnungspflicht: the
+// model/engine that produced it). It is scoped to the user who started the job, so one caller never reads
+// another's answer. A job the client polls after it was reaped (or an unknown id) reports 404, which the
+// UI treats as "ask again".
+func (s *Server) askStatus(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	id := r.PathValue("id")
+	s.askMu.Lock()
+	j, ok := s.askJobs[id]
+	var snap askJob
+	if ok {
+		snap = *j
 	}
-	if err != nil {
-		switch {
-		case errors.Is(err, aigentic.ErrDisabled):
-			writeErr(w, http.StatusServiceUnavailable, "The room assistant is not configured on this server")
-		case errors.Is(err, aigentic.ErrUnavailable):
-			writeErr(w, http.StatusServiceUnavailable, "No AI engine is available — an admin can link a Claude credential or start a local model in aigentic")
-		default:
-			writeErr(w, http.StatusBadGateway, "The assistant could not answer")
-		}
+	s.askMu.Unlock()
+	if !ok || snap.Owner != u.Username {
+		writeErr(w, http.StatusNotFound, "That request is no longer available — please ask again")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"output": res.Output, "model": res.Model, "engine": res.Engine})
+	resp := map[string]any{"id": snap.ID, "state": snap.State, "phase": snap.Phase, "docs": snap.Docs, "images": snap.Images}
+	switch snap.State {
+	case askStateDone:
+		resp["output"] = snap.Output
+		resp["model"] = snap.Model
+		resp["engine"] = snap.Engine
+	case askStateFailed:
+		resp["error"] = snap.Error
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// runAsk carries out one background turn: assemble the grounding, send it to aigentic, record the answer.
+// It advances the job's phase as it goes so the UI shows page-related progress, and it drives the two
+// resilience paths: a text-only retry when no engine can see images, and a full-bytes retry when a
+// put-once reference turned out stale (the bytes aigentic held were evicted). Runs on context.Background()
+// so a browser reload cannot cut it short.
+func (s *Server) runAsk(jobID, subject, prompt, format string) {
+	inline, gaps, origins := s.roomGrounding(prompt)
+	docs, images := countGrounding(inline)
+	s.updateAsk(jobID, func(j *askJob) {
+		j.Docs, j.Images = docs, images
+		j.Phase = askPhaseSending
+	})
+	grounded := withGroundingNote(inline, groundingNote(gaps))
+
+	res, err := s.runGrounded(subject, prompt, format, grounded)
+
+	// A turn that referenced already-held bytes (put-once) can fail if aigentic evicted them. Drop the
+	// remembered references and retry ONCE with full content, so the optimization can never make an answer
+	// fail where full bytes would have succeeded (Self-Healing).
+	if err != nil && usesRefs(grounded) {
+		for _, o := range origins {
+			s.dropRef(o.Key)
+		}
+		inline, gaps, origins = s.roomGrounding(prompt)
+		grounded = withGroundingNote(inline, groundingNote(gaps))
+		res, err = s.runGrounded(subject, prompt, format, grounded)
+	}
+
+	if err != nil {
+		s.updateAsk(jobID, func(j *askJob) {
+			j.State = askStateFailed
+			j.Error = askErrorMessage(err)
+		})
+		return
+	}
+	// Remember the references aigentic returned so the NEXT turn sends only them, not the bytes again.
+	s.rememberRefs(res.Context, origins)
+	s.updateAsk(jobID, func(j *askJob) {
+		j.State = askStateDone
+		j.Phase = askPhaseDone
+		j.Output, j.Model, j.Engine = res.Output, res.Model, res.Engine
+	})
+}
+
+// runGrounded sends one assembled grounding to aigentic, transparently retrying WITHOUT images when the
+// only reachable engine cannot see them (aigentic 422): the text grounding still stands and a note tells
+// the model it could not see the room's pictures, so a room with a text-only engine keeps its assistant
+// instead of losing it the moment it holds one image (kein stummes Ausbleiben).
+func (s *Server) runGrounded(subject, prompt, format string, inline []aigentic.InlineFile) (aigentic.Res, error) {
+	res, err := s.ai.Run(context.Background(), subject, aigentic.Req{Prompt: prompt, OutputFormat: format, Inline: inline})
+	if errors.Is(err, aigentic.ErrNoVisionEngine) {
+		textOnly := withGroundingNote(dropImageParts(inline), visionUnavailableNote)
+		res, err = s.ai.Run(context.Background(), subject, aigentic.Req{Prompt: prompt, OutputFormat: format, Inline: textOnly})
+	}
+	return res, err
+}
+
+// updateAsk applies fn to a live job under the lock, stamping the terminal time when the job finishes so
+// the reaper can retire it after askJobTTL. A no-op if the job was already reaped.
+func (s *Server) updateAsk(id string, fn func(*askJob)) {
+	s.askMu.Lock()
+	defer s.askMu.Unlock()
+	j, ok := s.askJobs[id]
+	if !ok {
+		return
+	}
+	fn(j)
+	if (j.State == askStateDone || j.State == askStateFailed) && j.Done == 0 {
+		j.Done = time.Now().Unix()
+	}
+}
+
+// reapAskJobsLocked drops finished jobs older than askJobTTL, bounding the in-memory registry. The caller
+// holds askMu. A still-running job is never reaped.
+func (s *Server) reapAskJobsLocked() {
+	cutoff := time.Now().Add(-askJobTTL).Unix()
+	for id, j := range s.askJobs {
+		if j.Done != 0 && j.Done < cutoff {
+			delete(s.askJobs, id)
+		}
+	}
+}
+
+// WaitAsk blocks until every in-flight background ask turn has finished. Used to drain jobs
+// deterministically (a test that must not race a temp-dir cleanup, a graceful stop).
+func (s *Server) WaitAsk() { s.askWG.Wait() }
+
+// askErrorMessage maps an aigentic failure to the same clean, user-facing reason the old synchronous
+// handler returned, now stored on the job for the UI to show.
+func askErrorMessage(err error) string {
+	switch {
+	case errors.Is(err, aigentic.ErrDisabled):
+		return "The room assistant is not configured on this server"
+	case errors.Is(err, aigentic.ErrUnavailable):
+		return "No AI engine is available — an admin can link a Claude credential or start a local model in aigentic"
+	default:
+		return "The assistant could not answer"
+	}
+}
+
+// countGrounding counts the document parts and image parts in an assembled grounding, for the progress
+// the UI shows ("room context ready — N documents, M images").
+func countGrounding(inline []aigentic.InlineFile) (docs, images int) {
+	for _, f := range inline {
+		if strings.HasPrefix(f.MediaType, "image/") {
+			images++
+		} else {
+			docs++
+		}
+	}
+	return docs, images
+}
+
+// usesRefs reports whether any part of a grounding was sent as a put-once reference (empty content, a
+// reference to bytes aigentic already holds) rather than full bytes.
+func usesRefs(inline []aigentic.InlineFile) bool {
+	for _, f := range inline {
+		if f.Ref != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// ── put-once / reference-many cache ───────────────────────────────────────────────────────────────
+//
+// After aigentic reads a document/image once it returns a reference to the bytes it now holds. presentr
+// remembers each reference against the piece it came from, so the next turn sends only the reference and
+// the full bytes are put ONCE, not re-shipped on every question — the fix for a large PDF timing out at
+// the edge. Keys are stable per document (and per image within a document); the cache lives in memory and
+// is invalidated when a document is deleted or re-read.
+
+// textRefKey / imageRefKey are the stable cache keys for a document's text part and for one image read
+// out of it (keyed by the image's section index, which survives a resume without re-keying).
+func textRefKey(docID string) string           { return "t:" + docID }
+func imageRefKey(docID string, idx int) string { return "i:" + docID + ":" + strconv.Itoa(idx) }
+
+// refFor returns the remembered reference for a cache key, if aigentic previously kept that piece's bytes.
+func (s *Server) refFor(key string) (string, bool) {
+	if key == "" {
+		return "", false
+	}
+	s.refMu.Lock()
+	defer s.refMu.Unlock()
+	ref, ok := s.refs[key]
+	return ref, ok
+}
+
+// rememberRefs records the references aigentic returned for this turn's grounding parts, matching each
+// returned reference (by the path presentr sent) to the document/image it came from (origins). Only parts
+// sent in FULL are in origins, so a partial send is never remembered as if it were the whole document.
+func (s *Server) rememberRefs(ctx []aigentic.ContextRef, origins []groundingOrigin) {
+	if len(ctx) == 0 || len(origins) == 0 {
+		return
+	}
+	keyByPath := make(map[string]string, len(origins))
+	for _, o := range origins {
+		if o.Key != "" {
+			keyByPath[o.Path] = o.Key
+		}
+	}
+	s.refMu.Lock()
+	defer s.refMu.Unlock()
+	for _, c := range ctx {
+		if c.Ref == "" {
+			continue
+		}
+		if key, ok := keyByPath[c.Path]; ok {
+			s.refs[key] = c.Ref
+		}
+	}
+}
+
+// dropRef forgets one remembered reference (a stale-reference recovery).
+func (s *Server) dropRef(key string) {
+	if key == "" {
+		return
+	}
+	s.refMu.Lock()
+	delete(s.refs, key)
+	s.refMu.Unlock()
+}
+
+// invalidateRefs forgets every reference for a document — its text part and all its images — so a later
+// turn re-sends fresh content. Called when the document is deleted or re-read (its bytes changed).
+func (s *Server) invalidateRefs(docID string) {
+	if docID == "" {
+		return
+	}
+	prefix := "i:" + docID + ":"
+	s.refMu.Lock()
+	defer s.refMu.Unlock()
+	delete(s.refs, textRefKey(docID))
+	for k := range s.refs {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.refs, k)
+		}
+	}
+}
+
+// groundingOrigin ties one grounding part (by the path aigentic echoes back) to the ref-cache key of the
+// document/image it came from, so a returned reference can be filed against the right piece. Only parts
+// sent in full (or already sent as a reference) get an origin — never a partial text send.
+type groundingOrigin struct {
+	Path string
+	Key  string
 }
 
 // visionUnavailableNote is prepended when an image-bearing turn is retried without its images because no
@@ -148,26 +409,44 @@ type groundingGaps struct {
 // separated with blank lines) — NOT a new retrieval engine or a vector store (Keine ähnlichen
 // Geschwister; the task's "loese es mit den Mitteln, die da sind"). prompt is the question the selection
 // is relevant to; "" (no question) keeps the leading text.
-func (s *Server) roomGrounding(prompt string) (inline []aigentic.InlineFile, gaps groundingGaps) {
+func (s *Server) roomGrounding(prompt string) (inline []aigentic.InlineFile, gaps groundingGaps, origins []groundingOrigin) {
 	docs := s.docs.List()
 	out := make([]aigentic.InlineFile, 0, len(docs))
 	var total int64
 	fits := func(n int) bool { return total+int64(n) <= maxGroundingBytes }
-	add := func(title, content, media string) {
+
+	// emit adds one cacheable grounding part (a text document, a file's read text, or one read-out image).
+	// If aigentic already holds this piece's bytes (a remembered reference) it sends ONLY the reference —
+	// no bytes, no budget cost: the put-once/reference-many win. Otherwise it sends the full content within
+	// the budget, naming an over-budget part in gaps rather than dropping it silently. Either way it records
+	// an origin, so the reference aigentic returns can be filed against this exact piece. isImage routes an
+	// over-budget miss to the right gap list.
+	emit := func(key, path, content, media string, isImage bool) {
+		if ref, ok := s.refFor(key); ok {
+			out = append(out, aigentic.InlineFile{Path: path, MediaType: media, Ref: ref})
+			origins = append(origins, groundingOrigin{Path: path, Key: key})
+			return
+		}
 		if content == "" {
 			return
 		}
 		if !fits(len(content)) {
-			gaps.omitted = append(gaps.omitted, groundingPath(title))
+			if isImage {
+				gaps.omittedImages = append(gaps.omittedImages, path)
+			} else {
+				gaps.omitted = append(gaps.omitted, path)
+			}
 			return
 		}
 		total += int64(len(content))
-		out = append(out, aigentic.InlineFile{Path: groundingPath(title), Content: content, MediaType: media})
+		out = append(out, aigentic.InlineFile{Path: path, Content: content, MediaType: media})
+		origins = append(origins, groundingOrigin{Path: path, Key: key})
 	}
+
 	for _, d := range docs {
 		switch d.Kind {
 		case "text":
-			add(d.Title, strings.TrimSpace(d.Content), "text/markdown")
+			emit(textRefKey(d.ID), groundingPath(d.Title), strings.TrimSpace(d.Content), "text/markdown", false)
 		case "file":
 			switch d.ExtractState {
 			case "ready":
@@ -181,15 +460,26 @@ func (s *Server) roomGrounding(prompt string) (inline []aigentic.InlineFile, gap
 				if t == "" {
 					continue
 				}
-				remaining := int(maxGroundingBytes - total)
-				if len(t) <= remaining {
-					add(d.Title, t, "text/markdown")
-				} else if kept := selectRelevantText(t, prompt, remaining); kept != "" {
-					total += int64(len(kept))
-					out = append(out, aigentic.InlineFile{Path: groundingPath(d.Title), Content: kept, MediaType: "text/markdown"})
-					gaps.partial = append(gaps.partial, groundingPath(d.Title))
+				key := textRefKey(d.ID)
+				path := groundingPath(d.Title)
+				if ref, ok := s.refFor(key); ok {
+					out = append(out, aigentic.InlineFile{Path: path, MediaType: "text/markdown", Ref: ref})
+					origins = append(origins, groundingOrigin{Path: path, Key: key})
 				} else {
-					gaps.omitted = append(gaps.omitted, groundingPath(d.Title))
+					remaining := int(maxGroundingBytes - total)
+					if len(t) <= remaining {
+						total += int64(len(t))
+						out = append(out, aigentic.InlineFile{Path: path, Content: t, MediaType: "text/markdown"})
+						origins = append(origins, groundingOrigin{Path: path, Key: key})
+					} else if kept := selectRelevantText(t, prompt, remaining); kept != "" {
+						// A PARTIAL send is not the whole document, so it is NOT given an origin — caching a
+						// reference for it would later re-send only the partial as if it were the full file.
+						total += int64(len(kept))
+						out = append(out, aigentic.InlineFile{Path: path, Content: kept, MediaType: "text/markdown"})
+						gaps.partial = append(gaps.partial, path)
+					} else {
+						gaps.omitted = append(gaps.omitted, path)
+					}
 				}
 				// The images READ OUT of this file at upload — kept compressed beside its text — are grounded
 				// as their OWN parts (image/jpeg), so the assistant SEES the pictures (a nameplate, a wiring
@@ -198,14 +488,8 @@ func (s *Server) roomGrounding(prompt string) (inline []aigentic.InlineFile, gap
 				// image part makes the whole turn vision-only on aigentic's side, which the ask handler honours.
 				if pics, ok := s.docs.ExtractImages(d.ID); ok {
 					for _, im := range pics {
-						b64 := base64.StdEncoding.EncodeToString(im.Data)
 						label := imageGroundingLabel(d.Title, im.Page)
-						if !fits(len(b64)) {
-							gaps.omittedImages = append(gaps.omittedImages, label)
-							continue
-						}
-						total += int64(len(b64))
-						out = append(out, aigentic.InlineFile{Path: label, Content: b64, MediaType: groundingImageMime})
+						emit(imageRefKey(d.ID, im.Index), label, base64.StdEncoding.EncodeToString(im.Data), groundingImageMime, true)
 					}
 				}
 			case "pending", "reading":
@@ -213,9 +497,17 @@ func (s *Server) roomGrounding(prompt string) (inline []aigentic.InlineFile, gap
 			case "failed":
 				gaps.unread = append(gaps.unread, groundingPath(d.Title))
 			default:
-				// Legacy file with no read: ground by its bytes, bounded (the pre-extract behaviour).
+				// Legacy file with no read: ground by its bytes, bounded (the pre-extract behaviour). A
+				// remembered reference short-circuits the byte read entirely.
+				key := textRefKey(d.ID)
+				path := groundingPath(d.Title)
+				if ref, ok := s.refFor(key); ok {
+					out = append(out, aigentic.InlineFile{Path: path, MediaType: d.Mime, Ref: ref})
+					origins = append(origins, groundingOrigin{Path: path, Key: key})
+					continue
+				}
 				if !fits(int(d.Size)) {
-					gaps.omitted = append(gaps.omitted, groundingPath(d.Title))
+					gaps.omitted = append(gaps.omitted, path)
 					continue
 				}
 				b, ok := s.docs.Bytes(d.ID)
@@ -223,21 +515,22 @@ func (s *Server) roomGrounding(prompt string) (inline []aigentic.InlineFile, gap
 					continue
 				}
 				if !fits(len(b)) {
-					gaps.omitted = append(gaps.omitted, groundingPath(d.Title))
+					gaps.omitted = append(gaps.omitted, path)
 					continue
 				}
 				total += int64(len(b))
-				part := aigentic.InlineFile{Path: groundingPath(d.Title), MediaType: d.Mime}
+				part := aigentic.InlineFile{Path: path, MediaType: d.Mime}
 				if strings.HasPrefix(d.Mime, "text/") {
 					part.Content = string(b)
 				} else {
 					part.Content = base64.StdEncoding.EncodeToString(b)
 				}
 				out = append(out, part)
+				origins = append(origins, groundingOrigin{Path: path, Key: key})
 			}
 		}
 	}
-	return out, gaps
+	return out, gaps, origins
 }
 
 // groundingNote composes the honest disclosure prepended to a turn when the grounding is incomplete,

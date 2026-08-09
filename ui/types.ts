@@ -107,6 +107,36 @@ export interface AskResult {
   model?: string;
 }
 
+// POST ask now starts a BACKGROUND job (a grounded turn over a large pool can outlast the edge proxy's
+// ~100s limit and land a raw 524 page in the browser). It answers at once with the job id; the UI polls
+// GET ask/{id} for granular progress and, when done, the answer.
+export interface AskJobStart {
+  jobId: string;
+  state: string;
+  phase: string;
+}
+
+// GET ask/{id} — one background ask job's progress and, once done, its answer. phase drives the granular
+// step the UI shows instead of a bare spinner; docs/images count what the room context carried.
+export interface AskJob {
+  id: string;
+  state: 'running' | 'done' | 'failed';
+  phase: 'grounding' | 'sending' | 'done';
+  docs: number;
+  images: number;
+  output?: string;
+  model?: string;
+  engine?: string;
+  error?: string;
+}
+
+// The granular progress the UI shows while an ask runs (mapped to a localized step label).
+export interface AskProgress {
+  phase: string;
+  docs: number;
+  images: number;
+}
+
 // ── connection diagram (backend internal/store) ──────────────────────────────────────────────
 export interface DiagramPort {
   id: string;

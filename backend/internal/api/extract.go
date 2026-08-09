@@ -562,6 +562,9 @@ func (s *Server) reExtract(w http.ResponseWriter, r *http.Request, _ *auth.User)
 		writeErr(w, http.StatusInternalServerError, "Could not start reading the file")
 		return
 	}
+	// A re-read replaces this file's extract text and images, so any references aigentic returned for the
+	// PREVIOUS read now point at stale bytes; drop them so the next turn sends the freshly read content.
+	s.invalidateRefs(id)
 	s.startExtraction(id)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": "pending"})
 }
