@@ -20,7 +20,7 @@ import {
   cn,
   useT,
   type ServiceContextProps,
-} from '@holistic/ui';
+} from '@holisdk/ui';
 import type {
   DiagramEdge,
   DiagramGeneration,

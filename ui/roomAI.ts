@@ -12,7 +12,7 @@
 // than the edge proxy's ~100s limit, which would return a raw 524 page instead of an answer). So askRoom
 // starts the job, then POLLS its status, reporting granular progress to the caller until the answer is
 // ready — the Chat tab and the Connection diagram show these steps instead of a bare spinner.
-import type { ServiceContextProps } from '@holistic/ui';
+import type { ServiceContextProps } from '@holisdk/ui';
 import type { AskJob, AskJobStart, AskProgress, AskRequest, AskResult } from './types';
 
 // pollIntervalMs is how often the UI asks the backend how the turn is going. Short enough that each step

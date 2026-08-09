@@ -3,7 +3,7 @@
 // consumes one shared engine instead of hardcoding strings. Other locales are added downstream by
 // the nightly translation run. The shell shows the localized `service.presentr` label in the
 // sidebar, falling back to the plugin's displayName.
-import { registerMessages } from '@holistic/ui';
+import { registerMessages } from '@holisdk/ui';
 
 registerMessages({
   'en-US': {
