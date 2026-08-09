@@ -16,15 +16,17 @@ import (
 type stubAI struct {
 	called  bool
 	gotMime string
+	gotName string
 	text    string
 	engine  string
 	model   string
 	err     error
 }
 
-func (s *stubAI) Extract(_ context.Context, _ /*subject*/, _ /*filename*/, mime string, _ []byte) (string, string, string, error) {
+func (s *stubAI) Extract(_ context.Context, _ /*subject*/, filename, mime string, _ []byte) (string, string, string, error) {
 	s.called = true
 	s.gotMime = mime
+	s.gotName = filename
 	return s.text, s.engine, s.model, s.err
 }
 
@@ -295,5 +297,41 @@ func TestRunScannedPDFFallsBackToAI(t *testing.T) {
 	}
 	if !ai.called || res.Source != "ai" {
 		t.Fatalf("a scan with no text layer must fall back to AI: called=%v src=%q", ai.called, res.Source)
+	}
+}
+
+// A labeled image section must reach the AI under a name that ends in a real image extension, so
+// aigentic's claude-cli leaf writes it to disk as a picture the Read tool can open — not as a name
+// ending in ")" that the CLI treats as opaque binary.
+func TestReadSectionGivesImageSectionARealExtension(t *testing.T) {
+	ai := &stubAI{text: "nameplate", engine: "aigentic", model: "m"}
+	sec := Section{Label: "image 1 of 3 on page 4", Track: "image", Page: 4, Mime: "image/jpeg", Data: []byte{0xff, 0xd8}}
+	ReadSection(context.Background(), ai, "author", "Manual (2) (3).pdf", sec)
+	if got := ai.gotName; got != "Manual (2) (3).pdf (image 1 of 3 on page 4).jpg" {
+		t.Fatalf("a labeled image section must be sent under a .jpg name, got %q", got)
+	}
+}
+
+// A whole uploaded image whose title carries no image extension still reaches the AI under a .png name.
+func TestReadSectionGivesWholeImageARealExtension(t *testing.T) {
+	ai := &stubAI{text: "x", engine: "e", model: "m"}
+	sec := Section{Label: "image", Mime: "image/png", Data: []byte{0x89, 0x50}}
+	ReadSection(context.Background(), ai, "author", "Wiring photo", sec)
+	if got := ai.gotName; got != "Wiring photo.png" {
+		t.Fatalf("a whole image must be sent under a .png name, got %q", got)
+	}
+}
+
+func TestNameWithExt(t *testing.T) {
+	cases := []struct{ name, mime, want string }{
+		{"doc (image on page 2)", "image/jpeg", "doc (image on page 2).jpg"},
+		{"photo.JPG", "image/jpeg", "photo.JPG"}, // already has it (case-insensitive) — untouched
+		{"manual", "application/pdf", "manual.pdf"},
+		{"notes.txt", "text/plain", "notes.txt"}, // no known extension — untouched
+	}
+	for _, c := range cases {
+		if got := NameWithExt(c.name, c.mime); got != c.want {
+			t.Fatalf("NameWithExt(%q,%q)=%q want %q", c.name, c.mime, got, c.want)
+		}
 	}
 }

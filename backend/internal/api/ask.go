@@ -21,7 +21,13 @@ import (
 
 	"presentr/internal/aigentic"
 	"presentr/internal/auth"
+	"presentr/internal/extract"
 )
+
+// groundingImageMime is the media type every read-out image is grounded as (ExtractImages compresses
+// each picture to JPEG). Named once so the part's MediaType and its provenance-path extension stay in
+// step.
+const groundingImageMime = "image/jpeg"
 
 const (
 	maxAskBody = 1 << 20 // the prompt/format submission (the grounding is assembled server-side)
@@ -199,7 +205,7 @@ func (s *Server) roomGrounding(prompt string) (inline []aigentic.InlineFile, gap
 							continue
 						}
 						total += int64(len(b64))
-						out = append(out, aigentic.InlineFile{Path: label, Content: b64, MediaType: "image/jpeg"})
+						out = append(out, aigentic.InlineFile{Path: label, Content: b64, MediaType: groundingImageMime})
 					}
 				}
 			case "pending", "reading":
@@ -376,14 +382,17 @@ func groundingPath(title string) string {
 }
 
 // imageGroundingLabel is the provenance path for one read-out image part, naming the document and the
-// page the picture came from ("Room manual (image on page 6)"), so the model — and the honesty note that
-// lists an omitted one — can point at exactly which picture.
+// page the picture came from ("Room manual (image on page 6).jpg"), so the model — and the honesty note
+// that lists an omitted one — can point at exactly which picture. It ends in the image's real extension
+// because aigentic's claude-cli leaf writes this part to disk under this path and its Read tool only
+// treats the bytes as a picture when the name ends in an image extension; a label that ends in ")"
+// reads as opaque binary and burns a whole (often timing-out) attempt (see extract.NameWithExt).
 func imageGroundingLabel(title string, page int) string {
 	base := groundingPath(title)
 	if page > 0 {
-		return base + " (image on page " + strconv.Itoa(page) + ")"
+		return base + " (image on page " + strconv.Itoa(page) + ")" + extract.ExtForMime(groundingImageMime)
 	}
-	return base + " (image)"
+	return base + " (image)" + extract.ExtForMime(groundingImageMime)
 }
 
 // askFormat clamps the requested answer shape to what aigentic accepts, defaulting to markdown.
