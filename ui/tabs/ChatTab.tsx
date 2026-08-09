@@ -1,7 +1,7 @@
 // PENDING — SHARED CHAT AWAITS THE SDK MOVE (holistic PR #15, the "@holisdk/ui" SDK-Umzug).
 // This is presentr's OWN working room chat, grounded in the document pool. It is deliberately NOT
-// the ONE shared @holistic/ui <Chat> building block: <Chat> (and its ChatAdapter/ChatEngine/
-// Conversation/… types) does not yet exist in @holistic/ui — it lives on holistic's unmerged
+// the ONE shared @holisdk/ui <Chat> building block: <Chat> (and its ChatAdapter/ChatEngine/
+// Conversation/… types) does not yet exist in @holisdk/ui — it lives on holistic's unmerged
 // SDK-move branch (PR #15). Until that move lands, importing it breaks the dashboard's Vite build,
 // so the shared-chat rewrite is held back and this proven chat stays in place. When PR #15 merges,
 // swap this tab for the shared <Chat> driven by a room ChatAdapter (see the reverted commit
@@ -25,7 +25,7 @@ import {
   useLiveQuery,
   useT,
   type ServiceContextProps,
-} from '@holistic/ui';
+} from '@holisdk/ui';
 import type { ChatHistory, ChatMessage, DocsResponse } from '../types';
 import { askRoom, askStepLabel, describeAskError } from '../roomAI';
 

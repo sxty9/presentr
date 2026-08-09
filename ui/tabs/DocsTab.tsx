@@ -30,7 +30,7 @@ import {
   type ServiceContextProps,
   type TextPayload,
   type ViewerKind,
-} from '@holistic/ui';
+} from '@holisdk/ui';
 import type { DocsResponse, Document, ExtractResponse, UploadResponse } from '../types';
 
 // The document pool — workflow stage 1. It takes in the room's knowledge three equal ways, exactly
