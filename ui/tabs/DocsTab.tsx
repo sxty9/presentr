@@ -408,9 +408,16 @@ export function DocsTab({ api, ui }: Pick<ServiceContextProps, 'api' | 'ui'>) {
                   openLabel={t('presentr.openFile')}
                   deleteLabel={t('presentr.delete')}
                   readingLabel={
-                    d.extractState === 'reading' && (d.extractSectionsTotal ?? 0) > 1
+                    (d.extractSectionsTotal ?? 0) > 0
                       ? t('presentr.extractReadingSections', { done: d.extractSectionsDone ?? 0, total: d.extractSectionsTotal ?? 0 })
                       : t('presentr.extractReading')
+                  }
+                  imagesBadge={
+                    // A text-layer file whose text is ready but whose images are still being read: show the
+                    // image-track progress so the second track is visible at a glance in the list.
+                    d.extractState === 'ready' && (d.extractSectionsTotal ?? 0) > 0 && (d.extractSectionsDone ?? 0) < (d.extractSectionsTotal ?? 0)
+                      ? t('presentr.trackImageBadge', { done: d.extractSectionsDone ?? 0, total: d.extractSectionsTotal ?? 0 })
+                      : undefined
                   }
                   unreadLabel={t('presentr.extractUnread')}
                 />
@@ -510,6 +517,7 @@ function DocRow({
   openLabel,
   deleteLabel,
   readingLabel,
+  imagesBadge,
   unreadLabel,
 }: {
   doc: Document;
@@ -520,6 +528,7 @@ function DocRow({
   openLabel: string;
   deleteLabel: string;
   readingLabel: string;
+  imagesBadge?: string;
   unreadLabel: string;
 }) {
   const entry: FileEntry =
@@ -561,12 +570,13 @@ function DocRow({
           </Stack>
         </Stack>
         <Stack direction="row" align="center" gap={2} className="shrink-0">
-          {/* At-a-glance read state for a file: a file being read (a large one shows how far — "section 7
-              of 40"), or one whose read failed, shows a badge; a successfully read file needs no attention
-              and shows none (Intuitiv by Design). */}
+          {/* At-a-glance read state for a file: a file being read (showing how far — "image 3 of 6"), a
+              text-ready file whose images are still being read (its own badge), or one whose read failed,
+              shows a badge; a fully-read file needs no attention and shows none (Intuitiv by Design). */}
           {doc.kind === 'file' && (doc.extractState === 'pending' || doc.extractState === 'reading') && (
             <Badge variant="neutral">{readingLabel}</Badge>
           )}
+          {doc.kind === 'file' && imagesBadge && <Badge variant="neutral">{imagesBadge}</Badge>}
           {doc.kind === 'file' && doc.extractState === 'failed' && <Badge variant="danger">{unreadLabel}</Badge>}
           <IconButton
             label={deleteLabel}
@@ -585,12 +595,46 @@ function DocRow({
   );
 }
 
-// The extraction section of a file's detail panel: it shows the ONE named read state and lets the user
-// act on it. Reading shows a quiet "reading…" note (the state ENDS — the list polls and this resolves);
-// a failed read shows why and offers "Read again" (retry from the stored bytes, no re-upload); a
-// finished read names its source (exact text layer, or recognized by a model) and can reveal the text
-// the assistant will actually draw on. A file with no read yet (uploaded before this feature) offers to
-// read it now.
+// TrackStatus shows the file's TWO independent read tracks side by side (the task's decoupling): the
+// TEXT track — read exactly and locally, no AI, the moment the read starts — and the IMAGE track — each
+// embedded picture read on its own, named by the page it sits on. A file with no images shows only the
+// text track; a scan with no text layer shows the image track reading its pages. Seeing both makes clear
+// that the text is never held up by a slow photo.
+function TrackStatus({ doc, t }: { doc: Document; t: ReturnType<typeof useT> }) {
+  const total = doc.extractSectionsTotal ?? 0;
+  const done = doc.extractSectionsDone ?? 0;
+  const label = doc.extractSectionLabel ?? '';
+  const hasTextTrack = !!doc.extractTextLayer;
+  const imagesInProgress = total > 0 && done < total;
+  return (
+    <Stack gap={1} align="start" className="w-full">
+      <Stack direction="row" gap={2} align="center" wrap>
+        <Badge variant={hasTextTrack ? 'success' : 'neutral'}>{t('presentr.trackTextHeading')}</Badge>
+        <Text variant="caption" color={hasTextTrack ? 'secondary' : 'tertiary'}>
+          {hasTextTrack ? t('presentr.trackTextReady') : t('presentr.trackTextNone')}
+        </Text>
+      </Stack>
+      {total > 0 && (
+        <Stack direction="row" gap={2} align="center" wrap>
+          <Badge variant={imagesInProgress ? 'neutral' : 'success'}>{t('presentr.trackImagesHeading')}</Badge>
+          <Text variant="caption" color="secondary">
+            {imagesInProgress
+              ? label
+                ? t('presentr.trackImagesCurrent', { label, done, total })
+                : t('presentr.trackImagesProgress', { done, total })
+              : t('presentr.trackImagesReady', { total })}
+          </Text>
+        </Stack>
+      )}
+    </Stack>
+  );
+}
+
+// The extraction section of a file's detail panel: it shows the named read state across BOTH tracks and
+// lets the user act on it. Reading shows the two tracks progressing (the state ENDS — the list polls and
+// this resolves); a failed read shows why and offers "Read again" (retry from the stored bytes, no
+// re-upload); a finished read names its source (exact text layer, images read by a model, or both) and
+// can reveal the text the assistant will actually draw on. A file with no read yet offers to read it now.
 function ExtractSection({
   api,
   ui,
@@ -650,20 +694,20 @@ function ExtractSection({
     }
   }
 
+  const total = doc.extractSectionsTotal ?? 0;
+  const done = doc.extractSectionsDone ?? 0;
+  const imagesInProgress = total > 0 && done < total;
+
   if (state === 'pending' || state === 'reading') {
-    // A large file is read in page-sized sections: show how far along, so the wait is "section 7 of 40",
-    // never a blank spinner. An interruption resumes from here rather than starting over.
-    const total = doc.extractSectionsTotal ?? 0;
-    const done = doc.extractSectionsDone ?? 0;
-    const chunked = state === 'reading' && total > 1;
+    // The read is running. Both tracks are shown: the text layer (read at once, exact) and the images
+    // (read one at a time, named by page), so the wait is "image on page 6 — 3 of 6", never a blank
+    // spinner. An interruption resumes from here rather than starting over.
     return (
       <Stack gap={2} align="start" className="w-full">
-        <Badge variant="neutral">
-          {chunked ? t('presentr.extractReadingSections', { done, total }) : t('presentr.extractReading')}
-        </Badge>
-        {chunked && <ProgressBar value={Math.round((done / total) * 100)} tone="accent" className="w-full" />}
+        <TrackStatus doc={doc} t={t} />
+        {total > 0 && <ProgressBar value={Math.round((done / total) * 100)} tone="accent" className="w-full" />}
         <Text variant="caption" color="tertiary">
-          {chunked ? t('presentr.extractReadingBody', { done, total }) : t('presentr.extractPendingBody')}
+          {total > 1 ? t('presentr.extractReadingBody', { done, total }) : t('presentr.extractPendingBody')}
         </Text>
       </Stack>
     );
@@ -681,13 +725,30 @@ function ExtractSection({
   }
 
   if (state === 'ready') {
+    // A finished read names its provenance: exact text layer, images read by a model, or both (mixed).
     const source =
-      doc.extractSource === 'ai'
-        ? t('presentr.extractFromAI', { model: doc.extractModel || doc.extractEngine || 'the assistant' })
-        : t('presentr.extractFromLayer');
+      doc.extractSource === 'mixed'
+        ? t('presentr.extractFromMixed', { model: doc.extractModel || doc.extractEngine || 'the assistant' })
+        : doc.extractSource === 'ai'
+          ? t('presentr.extractFromAI', { model: doc.extractModel || doc.extractEngine || 'the assistant' })
+          : t('presentr.extractFromLayer');
     return (
       <Stack gap={2} align="start" className="w-full">
         <Text weight="semibold">{t('presentr.extractReadHeading')}</Text>
+        <TrackStatus doc={doc} t={t} />
+        {/* The text is usable now, but its images are still being read: show the progress and offer to
+            read the remaining images again (the text was never blocked on them). */}
+        {imagesInProgress && (
+          <>
+            <ProgressBar value={Math.round((done / total) * 100)} tone="accent" className="w-full" />
+            <Text variant="caption" color="tertiary">
+              {t('presentr.extractImagesIncomplete')}
+            </Text>
+            <Button variant="secondary" size="sm" loading={retrying} onClick={retry}>
+              {t('presentr.extractRetry')}
+            </Button>
+          </>
+        )}
         <Text variant="caption" color="tertiary">
           {source}
         </Text>

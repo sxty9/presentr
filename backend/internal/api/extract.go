@@ -121,44 +121,57 @@ func (s *Server) runExtraction(id string) {
 		_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: extractFailureReason(err), At: time.Now().Unix()})
 		return
 	}
-	// A text file or a PDF with a readable text layer is read locally — exact, no AI, no sections.
-	if plan.Local {
-		_ = s.docs.SetExtract(id, store.Extract{State: "ready", Text: plan.LocalText, Source: plan.Source, At: time.Now().Unix()})
+	s.readSections(id, d.Author, d.Title, plan, s.extractor())
+}
+
+// readSections carries out a two-track read (extract.Plan) and keeps the document's state honest
+// throughout. The TEXT track — a PDF's machine-readable text layer, or a text file — is exact and needs
+// no AI, so when it is present the document is marked "ready" with that text IMMEDIATELY, before a single
+// image is read: the assistant can use it at once and the presence of images never delays it. The IMAGE
+// track — each embedded picture, downscaled — is then read one at a time, augmenting the extract and
+// advancing a per-page counter ("image on page 6 — 3 of 6"). A scan with no text layer has no text track,
+// so it stays "reading" until its images resolve, exactly as before.
+//
+// A section that TIMES OUT is retried with a stretched deadline up to maxSectionAttempts, then named as
+// unread and skipped so one poison image cannot stall the rest. A genuine engine outage is a resumable
+// interruption: the read stops, the job is persisted, and it continues on restart (ResumePending) or a
+// retry — the text track stays usable throughout, so a failed image never costs the file its text.
+func (s *Server) readSections(id, subject, title string, plan extract.Plan, ai extract.AIExtractor) {
+	localText := plan.LocalText
+	hasText := localText != ""
+	sections := plan.Sections
+	total := len(sections)
+
+	// Pure local read: a text file, or a PDF text layer with no image track.
+	if total == 0 {
+		if hasText {
+			_ = s.docs.SetExtract(id, store.Extract{State: "ready", Text: localText, Source: plan.Source, TextLayer: true, At: time.Now().Unix()})
+		} else {
+			_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: noTextReason(nil), At: time.Now().Unix()})
+		}
 		return
 	}
-	ai := s.extractor()
-	if ai == nil {
+
+	// The image/scan track needs the AI. With no AI and no exact text, there is nothing to store but the
+	// clean, retriable "assistant not configured" reason.
+	if ai == nil && !hasText && sectionsNeedAI(sections) {
 		_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: extractFailureReason(extract.ErrNoAI), At: time.Now().Unix()})
 		return
 	}
-	s.readSections(id, d.Author, d.Title, plan.Sections, ai)
-}
+	// A lone oversized section with no exact text (a single image or one huge page) cannot be read at all.
+	if !hasText && total == 1 && sections[0].TooBig {
+		_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: extractFailureReason(extract.ErrTooLargeForAI), At: time.Now().Unix()})
+		return
+	}
 
-// readSections reads a file's AI sections one at a time, assembling the text and keeping the document's
-// state honest throughout. For a single section it behaves like the old single-pass read. For many
-// (a split PDF) it shows progress ("section 7 of 40"), persists a resume job after each section so an
-// interruption continues rather than restarts, and names any section that could not be read.
-//
-// A section that TIMES OUT is retried with a stretched deadline (sectionTimeout) up to maxSectionAttempts;
-// a structurally too-slow section that still overruns is then named as unread and SKIPPED, so a single
-// poison section can no longer reproduce the same timeout forever nor block the rest of the file. A
-// genuine engine outage (not a timeout) stays a plain, resumable interruption — it is not the section's
-// fault, so it does not spend the section's attempts.
-func (s *Server) readSections(id, subject, title string, sections []extract.Section, ai extract.AIExtractor) {
-	total := len(sections)
-	multi := total > 1
-
-	// Resume: if a prior run of THIS same plan (same section count) left completed sections behind, reuse
-	// them and pick up the attempt count of the section it was on — never re-read a section already read
-	// (the task's "nicht von vorn"), and never reset a stretched deadline back to the short one.
+	// Resume prior image progress from a persisted job of THE SAME plan (same section count), so an
+	// interrupted read never re-reads an image already read nor resets a stretched deadline.
 	var results []extract.SectionResult
 	attempts := 0
-	if multi {
-		if raw, ok := s.docs.ExtractJob(id); ok {
-			if done, at, ok := decodeJob(raw, total); ok {
-				results = done
-				attempts = at
-			}
+	if raw, ok := s.docs.ExtractJob(id); ok {
+		if done, at, ok := decodeJob(raw, total); ok {
+			results = done
+			attempts = at
 		}
 	}
 	resumeFrom := len(results)
@@ -166,76 +179,116 @@ func (s *Server) readSections(id, subject, title string, sections []extract.Sect
 		resumeFrom = total
 		results = results[:total]
 	}
-	if multi {
-		_ = s.docs.SetExtract(id, store.Extract{State: "reading", SectionsDone: resumeFrom, SectionsTotal: total})
-	}
+
+	// Publish the starting state: usable text already (ready) when a text layer exists, else plain reading.
+	s.publishProgress(id, hasText, localText, plan.Source, results, total, sectionLabel(sections, resumeFrom))
 
 	for i := resumeFrom; i < total; i++ {
-		// Read section i, stretching the deadline on each timeout up to maxSectionAttempts. attempts carries
-		// in from a resume so an already-stretched section is not restarted at the short deadline.
 		var r extract.SectionResult
 		for {
 			ctx, cancel := context.WithTimeout(context.Background(), sectionTimeout(attempts))
 			r = extract.ReadSection(ctx, ai, subject, title, sections[i])
 			cancel()
-			if r.Err == nil || r.TooBig || !isRetryableAbort(r.Err) {
-				break // read, or a per-section verdict (too big) — not a retry case
+			if r.Err == nil || r.TooBig || r.Note != "" || !isRetryableAbort(r.Err) {
+				break // read, a per-section verdict (too big / note) — not a retry case
 			}
 			if !errors.Is(r.Err, context.DeadlineExceeded) {
-				// A dropped engine (or a cancelled call) is an INTERRUPTION, not this section being slow: stop,
-				// keep what is read, and leave a named, resumable failed state. A retry (reExtract) or a restart
-				// (ResumePending, for the "reading" state) continues from exactly here. attempts is preserved so
-				// a stretched deadline survives the interruption.
-				if multi {
-					_ = s.docs.SetExtractJob(id, encodeJob(total, attempts, results))
-					_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: interruptedReason(i, total, r.Err), SectionsDone: i, SectionsTotal: total, At: time.Now().Unix()})
-				} else {
-					_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: extractFailureReason(r.Err), At: time.Now().Unix()})
-				}
+				// An engine outage (or a cancelled call) is an INTERRUPTION, not this image being slow. Keep
+				// what is read, persist the job, and stop — the text track stays usable and the image track
+				// resumes from exactly here on restart (ResumePending) or a retry. attempts is preserved.
+				_ = s.docs.SetExtractJob(id, encodeJob(total, attempts, results))
+				s.publishInterruption(id, hasText, localText, plan.Source, results, i, total, r.Err)
 				return
 			}
-			// A timeout. Give the section another, longer try — unless its attempts are used up.
 			attempts++
 			if attempts >= maxSectionAttempts {
 				break
 			}
-			if multi {
-				// Persist the raised attempt count so a crash-restart resumes the stretched read, not restarts it.
-				_ = s.docs.SetExtractJob(id, encodeJob(total, attempts, results))
-			}
+			// Persist the raised attempt count so a crash-restart resumes the stretched read, not restarts it.
+			_ = s.docs.SetExtractJob(id, encodeJob(total, attempts, results))
 		}
 
 		if r.Err != nil && errors.Is(r.Err, context.DeadlineExceeded) && attempts >= maxSectionAttempts {
-			// Structurally too slow even stretched: abandon THIS section. A multi-section read names it as
-			// unread (so the gap is disclosed, Kein stummes Ausbleiben) and carries on; a single-section file
-			// has nothing else to read, so this is the whole, named failure.
-			if !multi {
-				_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: tooSlowReason(), At: time.Now().Unix()})
-				return
-			}
-			r = extract.SectionResult{Label: sections[i].Label, Err: errSectionTooSlow}
+			// Structurally too slow even stretched: name THIS image/section as unread and carry on. The text
+			// track and the other images are unaffected (Kein stummes Ausbleiben).
+			r = extract.SectionResult{Label: sections[i].Label, Track: sections[i].Track, Page: sections[i].Page, Err: errSectionTooSlow}
 		}
 
 		results = append(results, r)
 		attempts = 0
-		if multi {
-			_ = s.docs.SetExtractJob(id, encodeJob(total, attempts, results))
-			_ = s.docs.SetExtract(id, store.Extract{State: "reading", SectionsDone: len(results), SectionsTotal: total})
-		}
+		_ = s.docs.SetExtractJob(id, encodeJob(total, attempts, results))
+		s.publishProgress(id, hasText, localText, plan.Source, results, total, sections[i].Label)
 	}
 
-	res, anyText := extract.AssembleText(results)
+	// Final assembly of both tracks.
+	res, anyText := extract.Combine(localText, plan.Source, results)
 	if !anyText {
-		// Nothing legible came out of any section (e.g. a lone oversized image, or every page unreadable).
-		// Fail with a named reason rather than store an empty "ready", and clear the resume job so a retry
-		// re-reads from the start rather than replaying the same empty result.
-		if multi {
-			_ = s.docs.SetExtractJob(id, nil)
-		}
+		// Nothing legible from any track (a scan where every page failed, or a lone oversized image). Fail
+		// with a named reason and clear the resume job so a retry re-reads rather than replaying the gap.
+		_ = s.docs.SetExtractJob(id, nil)
 		_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: noTextReason(results), SectionsDone: total, SectionsTotal: total, At: time.Now().Unix()})
 		return
 	}
-	_ = s.docs.SetExtract(id, store.Extract{State: "ready", Text: res.Text, Source: res.Source, Model: res.Model, Engine: res.Engine, At: time.Now().Unix()})
+	// A COMPLETE read clears its image-track counters (SectionsDone/Total left at zero): a "ready"
+	// document with counters is, by convention, one whose image track is still in flight, so a finished
+	// read must not look like one. The job is dropped by SetExtract once done >= total (0 >= 0 here).
+	_ = s.docs.SetExtract(id, store.Extract{
+		State: "ready", Text: res.Text, Source: res.Source, Model: res.Model, Engine: res.Engine,
+		TextLayer: hasText, At: time.Now().Unix(),
+	})
+}
+
+// publishProgress writes the document's read state as the image track advances. With a text track the
+// state is already "ready" — its exact text is usable now — and the combined text is rewritten after each
+// image so a recognized nameplate is added as soon as it is read; SectionsDone < SectionsTotal marks the
+// images still in flight. Without a text track (a scan) there is no usable text yet, so it is plain
+// "reading" progress. label names the most recent image by page, for "image on page 6 — 3 of 6".
+func (s *Server) publishProgress(id string, hasText bool, localText, source string, results []extract.SectionResult, total int, label string) {
+	done := len(results)
+	if hasText {
+		res, _ := extract.Combine(localText, source, results)
+		_ = s.docs.SetExtract(id, store.Extract{
+			State: "ready", Text: res.Text, Source: res.Source, Model: res.Model, Engine: res.Engine,
+			TextLayer: true, SectionsDone: done, SectionsTotal: total, SectionLabel: label, At: time.Now().Unix(),
+		})
+		return
+	}
+	_ = s.docs.SetExtract(id, store.Extract{State: "reading", SectionsDone: done, SectionsTotal: total, SectionLabel: label})
+}
+
+// publishInterruption records an engine outage mid-image-read. With a text track the state stays "ready"
+// (the text is usable); the image track is left incomplete (SectionsDone < SectionsTotal) with the job
+// persisted, so it resumes on restart or a retry rather than costing the file its text. A scan with no
+// usable text becomes a named, resumable "failed".
+func (s *Server) publishInterruption(id string, hasText bool, localText, source string, results []extract.SectionResult, done, total int, err error) {
+	if hasText {
+		res, _ := extract.Combine(localText, source, results)
+		_ = s.docs.SetExtract(id, store.Extract{
+			State: "ready", Text: res.Text, Source: res.Source, Model: res.Model, Engine: res.Engine,
+			TextLayer: true, SectionsDone: done, SectionsTotal: total, At: time.Now().Unix(),
+		})
+		return
+	}
+	_ = s.docs.SetExtract(id, store.Extract{State: "failed", Error: interruptedReason(done, total, err), SectionsDone: done, SectionsTotal: total, At: time.Now().Unix()})
+}
+
+// sectionsNeedAI reports whether any section is a real AI read (not a named-gap note), so a read with no
+// AI and no exact text can be failed cleanly rather than looping over sections it will never send.
+func sectionsNeedAI(sections []extract.Section) bool {
+	for _, sec := range sections {
+		if sec.Note == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// sectionLabel names the section at idx (the one about to be read), or "" past the end.
+func sectionLabel(sections []extract.Section, idx int) string {
+	if idx >= 0 && idx < len(sections) {
+		return sections[idx].Label
+	}
+	return ""
 }
 
 // isRetryableAbort reports whether a section-read error means the WHOLE read was interrupted (the engine
@@ -256,6 +309,9 @@ type jobSection struct {
 	Engine string `json:"engine"`
 	Model  string `json:"model"`
 	TooBig bool   `json:"tooBig"`
+	Track  string `json:"track,omitempty"`
+	Page   int    `json:"page,omitempty"`
+	Note   string `json:"note,omitempty"`
 	Err    string `json:"err,omitempty"`
 }
 type jobState struct {
@@ -269,7 +325,7 @@ type jobState struct {
 func encodeJob(total, attempts int, results []extract.SectionResult) []byte {
 	js := jobState{Total: total, Attempts: attempts, Sections: make([]jobSection, 0, len(results))}
 	for _, r := range results {
-		s := jobSection{Label: r.Label, Text: r.Text, Engine: r.Engine, Model: r.Model, TooBig: r.TooBig}
+		s := jobSection{Label: r.Label, Text: r.Text, Engine: r.Engine, Model: r.Model, TooBig: r.TooBig, Track: r.Track, Page: r.Page, Note: r.Note}
 		if r.Err != nil {
 			s.Err = r.Err.Error()
 		}
@@ -289,7 +345,7 @@ func decodeJob(raw []byte, total int) ([]extract.SectionResult, int, bool) {
 	}
 	out := make([]extract.SectionResult, 0, len(js.Sections))
 	for _, s := range js.Sections {
-		r := extract.SectionResult{Label: s.Label, Text: s.Text, Engine: s.Engine, Model: s.Model, TooBig: s.TooBig}
+		r := extract.SectionResult{Label: s.Label, Text: s.Text, Engine: s.Engine, Model: s.Model, TooBig: s.TooBig, Track: s.Track, Page: s.Page, Note: s.Note}
 		if s.Err != "" {
 			r.Err = errors.New(s.Err)
 		}
@@ -377,11 +433,17 @@ func shortReason(err error) string {
 	}
 }
 
-// noTextReason names why a read produced no text at all, from the section results.
+// noTextReason names why a read produced no text at all, from the section results — too large to send,
+// too slow even stretched, or simply nothing legible — so a retry is an informed choice.
 func noTextReason(results []extract.SectionResult) string {
 	for _, r := range results {
 		if r.TooBig {
 			return "This file is too large for the assistant to read in one request and could not be split into smaller parts, so its text could not be read."
+		}
+	}
+	for _, r := range results {
+		if errors.Is(r.Err, errSectionTooSlow) {
+			return tooSlowReason()
 		}
 	}
 	return "No legible text could be read from this file. You can retry."
@@ -393,7 +455,15 @@ func noTextReason(results []extract.SectionResult) string {
 // Ausbleiben); a chunked read resumes from its persisted job, not from the first page.
 func (s *Server) ResumePending() {
 	for _, d := range s.docs.List() {
-		if d.Kind == "file" && (d.ExtractState == "pending" || d.ExtractState == "reading") {
+		if d.Kind != "file" {
+			continue
+		}
+		switch {
+		case d.ExtractState == "pending" || d.ExtractState == "reading":
+			s.startExtraction(d.ID)
+		case d.ExtractState == "ready" && d.ExtractSectionsTotal > 0 && d.ExtractSectionsDone < d.ExtractSectionsTotal:
+			// A text-layer file whose image track was interrupted (the text is usable, the images are not
+			// finished): resume the remaining images from the persisted job so the read still ENDS complete.
 			s.startExtraction(d.ID)
 		}
 	}
@@ -416,8 +486,10 @@ func (s *Server) getExtract(w http.ResponseWriter, r *http.Request, _ *auth.User
 		"engine":        d.ExtractEngine,
 		"error":         d.ExtractError,
 		"size":          d.ExtractSize,
+		"textLayer":     d.ExtractTextLayer,
 		"sectionsDone":  d.ExtractSectionsDone,
 		"sectionsTotal": d.ExtractSectionsTotal,
+		"sectionLabel":  d.ExtractSectionLabel,
 		"text":          text,
 	})
 }

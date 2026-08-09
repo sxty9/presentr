@@ -276,11 +276,15 @@ func (s *SchemeDocs) SetExtract(id string, ex Extract) error {
 	switch ex.State {
 	case "pending":
 		d.ExtractState = "pending"
+		d.ExtractTextLayer = false
 		d.ExtractSectionsDone, d.ExtractSectionsTotal = 0, 0
+		d.ExtractSectionLabel = ""
 	case "reading":
 		d.ExtractState = "reading"
+		d.ExtractTextLayer = ex.TextLayer
 		d.ExtractSectionsDone = ex.SectionsDone
 		d.ExtractSectionsTotal = ex.SectionsTotal
+		d.ExtractSectionLabel = ex.SectionLabel
 	case "ready":
 		d.ExtractState = "ready"
 		d.ExtractSource = ex.Source
@@ -289,13 +293,17 @@ func (s *SchemeDocs) SetExtract(id string, ex Extract) error {
 		d.ExtractError = ""
 		d.ExtractSize = int64(len(ex.Text))
 		d.ExtractedAt = ex.At
-		d.ExtractSectionsDone, d.ExtractSectionsTotal = 0, 0
+		d.ExtractTextLayer = ex.TextLayer
+		d.ExtractSectionsDone, d.ExtractSectionsTotal = ex.SectionsDone, ex.SectionsTotal
+		d.ExtractSectionLabel = ex.SectionLabel
 	case "failed":
 		d.ExtractState = "failed"
 		d.ExtractError = ex.Error
 		d.ExtractedAt = ex.At
+		d.ExtractTextLayer = ex.TextLayer
 		if ex.SectionsTotal > 0 {
 			d.ExtractSectionsDone, d.ExtractSectionsTotal = ex.SectionsDone, ex.SectionsTotal
+			d.ExtractSectionLabel = ex.SectionLabel
 		}
 	default:
 		return nil
@@ -307,8 +315,9 @@ func (s *SchemeDocs) SetExtract(id string, ex Extract) error {
 	if err := s.putLocked(docPrefix+"/"+id, desc, meta); err != nil {
 		return err
 	}
-	if ex.State == "ready" {
-		_ = s.deleteLocked(jobPrefix + "/" + id) // a completed read no longer needs its resume job
+	// A completed read drops its resume job; a "ready" read whose image track is still running keeps it.
+	if ex.State == "ready" && ex.SectionsDone >= ex.SectionsTotal {
+		_ = s.deleteLocked(jobPrefix + "/" + id)
 	}
 	return nil
 }
