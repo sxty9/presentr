@@ -5,7 +5,7 @@ knowledge about a presentation room (device manuals, wiring notes, the room layo
 text) into something anyone can use: a searchable document pool, an auto-derived connection
 diagram of the devices and how they wire together, and an assistant that explains the room
 grounded in both. A Go backend behind the holistic Caddy proxy plus a dashboard plugin built
-on the **`@holisdk/ui`** SDK (consumed, never vendored).
+on the **`@holistic/ui`** SDK (consumed, never vendored).
 
 ```
 Browser ── https://<host> (Caddy, same-origin) ─┐
@@ -58,7 +58,7 @@ pool), **Connection** (the diagram derived from it), **Chat** (the assistant ove
 - `ui/Dashboard.tsx` — the plugin root: gates on the right, then renders the three tabs. The
   active tab lives in `nav.path`, so a browser reload lands on the same tab (Zustandserhalt).
 - `ui/tabs/` — one file per tab (`DocsTab`, `ConnectionTab`, `ChatTab`). Each renders **only**
-  `@holisdk/ui`, resolves every string via `useT()`.
+  `@holistic/ui`, resolves every string via `useT()`.
 - `ui/roomAI.ts` — the UI-side access point to the room's AI: a thin client of presentr's own
   `POST ask` endpoint. Both the Chat tab and the Connection diagram call `askRoom(api, …)` with only
   a prompt + output shape; the backend does the grounding (the pool's text AND uploaded files), so
@@ -88,7 +88,7 @@ pool), **Connection** (the diagram derived from it), **Chat** (the assistant ove
 - Keep three things in sync: `permissions/presentr.json` ⇄ `internal/rights` ⇄ the UI right constant.
 - No hardcoded UI strings: author them in `ui/i18n.ts` and resolve with `useT()` — the shared
   SDK i18n engine, never a local copy. Author in English; the nightly run translates.
-- UI may import only `@holisdk/ui` and `react` (holistic's `eslint.services.cjs` enforces it).
+- UI may import only `@holistic/ui` and `react` (holistic's `eslint.services.cjs` enforces it).
 - The daemon runs unprivileged and escalates nothing.
 - A data pool stays passive (it stores and returns; it never filters, evaluates or applies
   policy — do that in the api layer) and is reached through one access point per entity. Every

@@ -7,7 +7,7 @@
 // that endpoint — the Chat tab and the Connection diagram differ only in their prompt and requested
 // output shape. Every answer carries the model that produced it; the caller labels its bubble/turn
 // from AskResult.model/engine.
-import type { ServiceContextProps } from '@holisdk/ui';
+import type { ServiceContextProps } from '@holistic/ui';
 import type { AskRequest, AskResult } from './types';
 
 // Ask the room assistant. presentr's backend grounds the turn in the whole document pool and routes
