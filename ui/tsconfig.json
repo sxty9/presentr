@@ -4,7 +4,7 @@
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
-      "@holistic/ui": ["../../holistic/frontend/packages/ui/src/index.ts"]
+      "@holisdk/ui": ["../../holistic/frontend/packages/ui/src/index.ts"]
     }
   },
   "include": ["."]
