@@ -78,6 +78,43 @@ func New(baseURL, secret string) *Client {
 // Enabled reports whether the client is configured to run turns.
 func (c *Client) Enabled() bool { return c.base != "" && c.secret != "" }
 
+// RequestLimit asks aigentic for the maximum RAW bytes one request may carry — the per-request ceiling
+// aigentic OWNS and publishes as part of its interface. presentr uses it to size the sections a large
+// file is split into, so the boundary is ERFRAGT, not guessed: if aigentic raises or lowers its ceiling,
+// presentr follows with no code change (the Schnittstellen-Axiom). The value is read from the
+// `maxRequestBytes` field of aigentic's info endpoint. ok is false when the client is disabled, the
+// query cannot be made, or aigentic does not publish the field (an older build) — the caller then falls
+// back to a conservative floor rather than failing.
+func (c *Client) RequestLimit(ctx context.Context) (int64, bool) {
+	if !c.Enabled() {
+		return 0, false
+	}
+	endpoint := c.base + "/api/services/aigentic/info"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, false
+	}
+	req.Header.Set("X-Aigentic-Internal-Secret", c.secret)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, false
+	}
+	defer func() { _, _ = io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return 0, false
+	}
+	var out struct {
+		MaxRequestBytes int64 `json:"maxRequestBytes"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
+		return 0, false
+	}
+	if out.MaxRequestBytes <= 0 {
+		return 0, false
+	}
+	return out.MaxRequestBytes, true
+}
+
 // wireData mirrors the fields of aigentic.Request presentr sets, marshaled into the opaque prizm
 // Data the endpoint decodes for the chosen engine.
 type wireData struct {

@@ -27,7 +27,7 @@ func TestRoomGrounding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	parts, gaps := s.roomGrounding()
+	parts, gaps := s.roomGrounding("")
 	if len(parts) != 3 {
 		t.Fatalf("grounding has %d parts, want 3: %+v", len(parts), parts)
 	}
@@ -60,7 +60,7 @@ func TestRoomGroundingNamesOmittedDocuments(t *testing.T) {
 	big := strings.Repeat("x", maxGroundingBytes+1)
 	_ = s.docs.Add(store.Document{ID: store.NewID(), Title: "Huge manual", Kind: "text", Mime: "text/markdown", Content: big})
 
-	parts, gaps := s.roomGrounding()
+	parts, gaps := s.roomGrounding("")
 	if len(parts) != 1 || parts[0].Path != "Fits" {
 		t.Fatalf("grounding should carry only the fitting document, got %+v", parts)
 	}
@@ -94,7 +94,7 @@ func TestRoomGroundingUsesExtractAndNamesUnreadFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	parts, gaps := s.roomGrounding()
+	parts, gaps := s.roomGrounding("")
 	if len(parts) != 1 {
 		t.Fatalf("only the ready file should be grounded, got %d parts: %+v", len(parts), parts)
 	}

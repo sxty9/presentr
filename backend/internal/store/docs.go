@@ -41,13 +41,20 @@ type Document struct {
 	// recognized by aigentic's shared extract capability (an image, a scan — the text on a nameplate).
 	// A text document (kind "text") carries its text inline in Content, so it needs no separate
 	// extract and leaves these empty.
-	ExtractState  string `json:"extractState,omitempty"`  // "" (n/a) | "pending" | "ready" | "failed"
+	ExtractState  string `json:"extractState,omitempty"`  // "" (n/a) | "pending" | "reading" | "ready" | "failed"
 	ExtractSource string `json:"extractSource,omitempty"` // "text-layer" (deterministic) | "ai" (recognized)
 	ExtractModel  string `json:"extractModel,omitempty"`  // the AI model that read it (Kennzeichnungspflicht)
 	ExtractEngine string `json:"extractEngine,omitempty"` // the AI engine that read it
 	ExtractError  string `json:"extractError,omitempty"`  // why the read failed (state=="failed"); a retry can clear it
 	ExtractSize   int64  `json:"extractSize,omitempty"`   // byte length of the extract text (storage accounting)
 	ExtractedAt   int64  `json:"extractedAt,omitempty"`   // epoch seconds the read completed
+
+	// Section progress for a LARGE file read in pieces (state "reading"): a scanned PDF too big for one
+	// AI request is split into page-sized sections and read one at a time, so the state can say "section
+	// 7 of 40" instead of only "pending" (Portionierte Daten — the UI shows how far, not the pieces
+	// themselves). Zero for a small file read in one pass.
+	ExtractSectionsDone  int `json:"extractSectionsDone,omitempty"`
+	ExtractSectionsTotal int `json:"extractSectionsTotal,omitempty"`
 }
 
 // Extract is the outcome of reading a file document's text, produced OUTSIDE the pool (the pool is
@@ -55,13 +62,18 @@ type Document struct {
 // holds the read text), "failed" (Error names why; Text empty) or "pending" (a read is running/queued;
 // only State is touched, any prior Text is left intact so a retry never destroys the last good read).
 type Extract struct {
-	State  string // "pending" | "ready" | "failed"
+	State  string // "pending" | "reading" | "ready" | "failed"
 	Text   string // the read text (ready only)
 	Source string // "text-layer" | "ai" (ready only)
 	Model  string // AI model, when Source=="ai"
 	Engine string // AI engine, when Source=="ai"
 	Error  string // reason, when State=="failed"
 	At     int64  // epoch seconds the read completed (stamped by the caller)
+
+	// Progress for a chunked read (State "reading"/"failed" mid-way): how many page-sized sections have
+	// been read, out of how many. Left zero for a single-pass read.
+	SectionsDone  int
+	SectionsTotal int
 }
 
 // docState is the whole on-disk document: the room's flat, ordered list of items.
@@ -77,6 +89,7 @@ type DocPool struct {
 	path       string
 	blobDir    string
 	extractDir string // one file per document holding its derived extract text, kept out of the metadata a List walks
+	jobDir     string // one file per document holding an in-progress chunked-read job, so a read resumes after a crash
 	pool[docState]
 }
 
@@ -93,6 +106,7 @@ func OpenDocs(path string) (*DocPool, error) {
 		path:       path,
 		blobDir:    filepath.Join(filepath.Dir(path), "blobs"),
 		extractDir: filepath.Join(filepath.Dir(path), "extracts"),
+		jobDir:     filepath.Join(filepath.Dir(path), "extract-jobs"),
 	}
 	p.st = docState{Docs: []Document{}}
 	b, err := os.ReadFile(path)
@@ -248,6 +262,12 @@ func (p *DocPool) SetExtract(id string, ex Extract) error {
 	switch ex.State {
 	case "pending":
 		d.ExtractState = "pending"
+		d.ExtractSectionsDone, d.ExtractSectionsTotal = 0, 0
+	case "reading":
+		// A chunked read is in progress: record how far it has got, leaving any prior text intact.
+		d.ExtractState = "reading"
+		d.ExtractSectionsDone = ex.SectionsDone
+		d.ExtractSectionsTotal = ex.SectionsTotal
 	case "ready":
 		d.ExtractState = "ready"
 		d.ExtractSource = ex.Source
@@ -256,10 +276,15 @@ func (p *DocPool) SetExtract(id string, ex Extract) error {
 		d.ExtractError = ""
 		d.ExtractSize = int64(len(ex.Text))
 		d.ExtractedAt = ex.At
+		d.ExtractSectionsDone, d.ExtractSectionsTotal = 0, 0
 	case "failed":
 		d.ExtractState = "failed"
 		d.ExtractError = ex.Error
 		d.ExtractedAt = ex.At
+		// Keep the section counters so a resumable failure still shows how far it got.
+		if ex.SectionsTotal > 0 {
+			d.ExtractSectionsDone, d.ExtractSectionsTotal = ex.SectionsDone, ex.SectionsTotal
+		}
 	default:
 		return nil
 	}
@@ -267,8 +292,38 @@ func (p *DocPool) SetExtract(id string, ex Extract) error {
 	committed, err := p.persist(p.path)
 	if err != nil && !committed {
 		p.st.Docs = prev
+		return err
+	}
+	// A completed read no longer needs its resume job; drop it best-effort once the metadata is committed.
+	if ex.State == "ready" {
+		_ = os.Remove(filepath.Join(p.jobDir, id))
 	}
 	return err
+}
+
+// SetExtractJob persists the in-progress chunked-read job for a document (the sections read so far),
+// out of band beside the extract text, so a read interrupted by a crash or an engine outage RESUMES from
+// where it stopped rather than starting over (the task's "aus dem heraus fortgesetzt werden kann"). It is
+// the SAME entity reached through this one access point (no second store), computed OUTSIDE the pool and
+// handed in. Written atomically (temp→fsync→rename).
+func (p *DocPool) SetExtractJob(id string, job []byte) error {
+	if id == "" {
+		return nil
+	}
+	_, err := atomicWrite(filepath.Join(p.jobDir, id), job)
+	return err
+}
+
+// ExtractJob returns a document's persisted chunked-read job, and whether one is present.
+func (p *DocPool) ExtractJob(id string) ([]byte, bool) {
+	if id == "" {
+		return nil, false
+	}
+	b, err := os.ReadFile(filepath.Join(p.jobDir, id))
+	if err != nil {
+		return nil, false
+	}
+	return b, true
 }
 
 // ExtractText returns the derived text of a file document, and whether it was found. It buffers the
@@ -311,6 +366,7 @@ func (p *DocPool) Delete(id string) error {
 	if err == nil {
 		_ = os.Remove(filepath.Join(p.blobDir, id))    // drop the blob once the metadata is gone
 		_ = os.Remove(filepath.Join(p.extractDir, id)) // and its derived extract text
+		_ = os.Remove(filepath.Join(p.jobDir, id))     // and any in-progress read job
 	}
 	return err
 }

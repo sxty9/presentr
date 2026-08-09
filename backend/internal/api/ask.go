@@ -15,6 +15,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	"presentr/internal/aigentic"
@@ -50,7 +51,7 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request, u *auth.User) {
 		return
 	}
 
-	inline, gaps := s.roomGrounding()
+	inline, gaps := s.roomGrounding(prompt)
 	if note := groundingNote(gaps); note != "" {
 		// The grounding is not the whole pool: some documents were too large to include, and some
 		// files have not been read yet or could not be read. Rather than let the model answer as if it
@@ -89,6 +90,7 @@ type groundingGaps struct {
 	omitted []string // too large to fit aigentic's per-request budget
 	notRead []string // a file whose text has not been read yet (read still pending)
 	unread  []string // a file whose text read failed (a retry may fix it)
+	partial []string // a large read where only the sections relevant to the question were included
 }
 
 // roomGrounding turns the pool into aigentic inline parts. The key move of this feature: an uploaded
@@ -102,11 +104,16 @@ type groundingGaps struct {
 // read yet (state "") falls back to grounding by its bytes, bounded, so nothing uploaded before this
 // feature stops being usable.
 //
-// THE MISSING BUILDING BLOCK, still: splitting one large read into question-relevant sections (RAG)
-// belongs in aigentic, not here (Reuse before Build; Keine ähnlichen Geschwister). The extract is the
-// FOUNDATION that sibling order builds on — it chunks the read TEXT, not the raw bytes. Until it
-// lands, an over-budget extract is named as not-fully-consulted rather than faked.
-func (s *Server) roomGrounding() (inline []aigentic.InlineFile, gaps groundingGaps) {
+// USING THE RELEVANT SECTIONS, NOT EVERYTHING: a large file is now read in full (its scanned pages are
+// split, read and reassembled into one text), so a single extract can itself be big. When a ready
+// extract does not fit the remaining budget, presentr does NOT drop it and does NOT ship all of it —
+// it selects the parts of the read text most relevant to the question and includes those, naming the
+// document as only-partially-consulted (EHRLICH BLEIBEN). The selection uses the means at hand — lexical
+// overlap between the question and the read text's own paragraphs (the sections a chunked read already
+// separated with blank lines) — NOT a new retrieval engine or a vector store (Keine ähnlichen
+// Geschwister; the task's "loese es mit den Mitteln, die da sind"). prompt is the question the selection
+// is relevant to; "" (no question) keeps the leading text.
+func (s *Server) roomGrounding(prompt string) (inline []aigentic.InlineFile, gaps groundingGaps) {
 	docs := s.docs.List()
 	out := make([]aigentic.InlineFile, 0, len(docs))
 	var total int64
@@ -129,12 +136,27 @@ func (s *Server) roomGrounding() (inline []aigentic.InlineFile, gaps groundingGa
 		case "file":
 			switch d.ExtractState {
 			case "ready":
-				// Ground by the read text — small, exact enough, and already vision-read for images.
+				// Ground by the read text — small, exact enough, and already vision-read for images. A big
+				// read that does not fit is trimmed to the question-relevant sections rather than dropped.
 				text, ok := s.docs.ExtractText(d.ID)
-				if ok {
-					add(d.Title, strings.TrimSpace(text), "text/markdown")
+				if !ok {
+					continue
 				}
-			case "pending":
+				t := strings.TrimSpace(text)
+				if t == "" {
+					continue
+				}
+				remaining := int(maxGroundingBytes - total)
+				if len(t) <= remaining {
+					add(d.Title, t, "text/markdown")
+				} else if kept := selectRelevantText(t, prompt, remaining); kept != "" {
+					total += int64(len(kept))
+					out = append(out, aigentic.InlineFile{Path: groundingPath(d.Title), Content: kept, MediaType: "text/markdown"})
+					gaps.partial = append(gaps.partial, groundingPath(d.Title))
+				} else {
+					gaps.omitted = append(gaps.omitted, groundingPath(d.Title))
+				}
+			case "pending", "reading":
 				gaps.notRead = append(gaps.notRead, groundingPath(d.Title))
 			case "failed":
 				gaps.unread = append(gaps.unread, groundingPath(d.Title))
@@ -169,7 +191,7 @@ func (s *Server) roomGrounding() (inline []aigentic.InlineFile, gaps groundingGa
 // groundingNote composes the honest disclosure prepended to a turn when the grounding is incomplete,
 // naming each kind of gap with its own reason. Returns "" when the grounding is complete.
 func groundingNote(g groundingGaps) string {
-	if len(g.omitted) == 0 && len(g.notRead) == 0 && len(g.unread) == 0 {
+	if len(g.omitted) == 0 && len(g.notRead) == 0 && len(g.unread) == 0 && len(g.partial) == 0 {
 		return ""
 	}
 	var b strings.Builder
@@ -177,6 +199,10 @@ func groundingNote(g groundingGaps) string {
 	if len(g.omitted) > 0 {
 		b.WriteString("These documents were too large to include in full and were NOT provided to you: " +
 			strings.Join(g.omitted, ", ") + ". ")
+	}
+	if len(g.partial) > 0 {
+		b.WriteString("These documents are large, so only the parts most relevant to the question were included — other parts were left out: " +
+			strings.Join(g.partial, ", ") + ". ")
 	}
 	if len(g.notRead) > 0 {
 		b.WriteString("These uploaded files have not been read yet, so their text is NOT available to you: " +
@@ -186,8 +212,108 @@ func groundingNote(g groundingGaps) string {
 		b.WriteString("These uploaded files could not be read, so their text is NOT available to you: " +
 			strings.Join(g.unread, ", ") + ". ")
 	}
-	b.WriteString("If a complete answer would depend on any of them, say clearly that you could not read them.")
+	b.WriteString("If a complete answer would depend on any of them, say clearly what you could not read.")
 	return b.String()
+}
+
+// selectRelevantText picks the paragraphs of a large read most relevant to the question, up to budget
+// bytes, keeping them in their original order. It is deliberately simple — the means at hand, not a
+// retrieval engine: paragraphs (the blank-line-separated sections a chunked read already produced) are
+// scored by how many distinct question words they contain, the best are taken until the budget is spent,
+// and they are re-joined in reading order. With no question, the leading paragraphs are kept. Returns ""
+// when not even one paragraph fits.
+func selectRelevantText(text, prompt string, budget int) string {
+	if budget <= 0 {
+		return ""
+	}
+	paras := splitParagraphs(text)
+	if len(paras) == 0 {
+		return ""
+	}
+	terms := queryTerms(prompt)
+
+	type scored struct {
+		idx   int
+		score int
+	}
+	ranked := make([]scored, len(paras))
+	for i, p := range paras {
+		ranked[i] = scored{idx: i, score: paragraphScore(p, terms)}
+	}
+	// Highest score first; ties keep reading order so a no-question request keeps the leading text.
+	sort.SliceStable(ranked, func(a, b int) bool {
+		if ranked[a].score != ranked[b].score {
+			return ranked[a].score > ranked[b].score
+		}
+		return ranked[a].idx < ranked[b].idx
+	})
+
+	chosen := map[int]bool{}
+	used := 0
+	const sep = "\n\n"
+	for _, r := range ranked {
+		cost := len(paras[r.idx])
+		if used > 0 {
+			cost += len(sep)
+		}
+		if used+cost > budget {
+			continue // skip this one, a later shorter paragraph may still fit
+		}
+		chosen[r.idx] = true
+		used += cost
+	}
+	var b strings.Builder
+	for i, p := range paras {
+		if !chosen[i] {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString(sep)
+		}
+		b.WriteString(p)
+	}
+	return b.String()
+}
+
+// splitParagraphs breaks the read text into paragraphs on blank lines (the boundary a chunked read uses
+// between sections), dropping empty runs.
+func splitParagraphs(text string) []string {
+	var out []string
+	for _, p := range strings.Split(text, "\n\n") {
+		if s := strings.TrimSpace(p); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// queryTerms reduces a question to the distinct lowercase words worth matching (three characters or
+// more), so scoring ignores punctuation and filler-length tokens.
+func queryTerms(prompt string) map[string]bool {
+	terms := map[string]bool{}
+	for _, w := range strings.FieldsFunc(strings.ToLower(prompt), func(r rune) bool {
+		return !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9')
+	}) {
+		if len(w) >= 3 {
+			terms[w] = true
+		}
+	}
+	return terms
+}
+
+// paragraphScore counts how many distinct question terms appear in a paragraph.
+func paragraphScore(p string, terms map[string]bool) int {
+	if len(terms) == 0 {
+		return 0
+	}
+	lower := strings.ToLower(p)
+	score := 0
+	for t := range terms {
+		if strings.Contains(lower, t) {
+			score++
+		}
+	}
+	return score
 }
 
 // groundingPath is the display/provenance path aigentic shows for a grounding part; never used for
