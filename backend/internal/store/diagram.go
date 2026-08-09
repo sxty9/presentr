@@ -54,13 +54,28 @@ type Graph struct {
 	Edges []Edge `json:"edges"`
 }
 
+// Generation is the OUTCOME of the last "generate from documents" attempt, kept beside the diagram so
+// it survives a reload and is shared by everyone in the room (the diagram is one shared artifact). It
+// is what makes the result PERSISTENT rather than a vanishing toast: an attempt that concluded no
+// connections, or that failed, leaves a named state and the assistant's own explanation here, which the
+// Connection tab shows as a standing banner until the next attempt. State "ok" carries the model that
+// produced the diagram (Kennzeichnungspflicht für KI-Modellantworten); "empty"/"failed" carry a Note.
+type Generation struct {
+	State  string `json:"state,omitempty"`  // "" (never generated) | "ok" | "empty" | "failed"
+	Note   string `json:"note,omitempty"`   // the assistant's explanation (empty) or the failure reason (failed)
+	Model  string `json:"model,omitempty"`  // the AI model that produced the answer (Kennzeichnungspflicht)
+	Engine string `json:"engine,omitempty"` // the AI engine that produced the answer
+	At     int64  `json:"at,omitempty"`     // epoch seconds the attempt finished
+}
+
 // DiagramSnapshot is the whole on-disk state of the room's diagram.
 type DiagramSnapshot struct {
-	Doc       Graph  `json:"doc"`       // the document-derived baseline
-	Current   Graph  `json:"current"`   // what the user sees and edits
-	Modified  bool   `json:"modified"`  // true => "Manuell modifiziert"; false => the document state
-	SourceKey string `json:"sourceKey"` // fingerprint of the documents the baseline was derived from
-	Generated int64  `json:"generated"` // when the baseline was last derived (epoch seconds)
+	Doc        Graph      `json:"doc"`                  // the document-derived baseline
+	Current    Graph      `json:"current"`              // what the user sees and edits
+	Modified   bool       `json:"modified"`             // true => "Manuell modifiziert"; false => the document state
+	SourceKey  string     `json:"sourceKey"`            // fingerprint of the documents the baseline was derived from
+	Generated  int64      `json:"generated"`            // when the baseline was last derived (epoch seconds)
+	Generation Generation `json:"generation,omitempty"` // the outcome of the last generate attempt (persistent, shared)
 }
 
 // DiagramPool is the atomic, in-memory-cached persistence for the single shared room diagram.

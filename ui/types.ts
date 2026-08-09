@@ -162,11 +162,24 @@ export interface DiagramGraph {
   nodes: DiagramNode[];
   edges: DiagramEdge[];
 }
+// The outcome of the last "generate from documents" attempt, stored on the shared diagram so it
+// survives a reload and is shown as a STANDING banner (not a vanishing toast): "empty" carries the
+// assistant's own explanation of why it concluded no connections; "failed" carries the failure reason;
+// "ok" carries the model that produced the diagram (Kennzeichnungspflicht für KI-Modellantworten).
+export interface DiagramGeneration {
+  state: '' | 'ok' | 'empty' | 'failed';
+  note?: string;
+  model?: string;
+  engine?: string;
+  at?: number;
+}
+
 // GET/PUT diagram — the current graph plus which state it is in.
 export interface DiagramView extends DiagramGraph {
   state: 'document' | 'manual';
   modified: boolean;
   sourceKey: string;
   generated: number;
+  generation?: DiagramGeneration;
 }
 
