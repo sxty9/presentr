@@ -36,8 +36,9 @@ import (
 // holds the raw bytes of file documents, one node per document (kept out of the metadata a List
 // walks — Portionierte Daten). Both live in the same store, reached through this one access point.
 const (
-	docPrefix  = "documents"
-	blobPrefix = "blobs"
+	docPrefix     = "documents"
+	blobPrefix    = "blobs"
+	extractPrefix = "extracts" // the derived extract text of a file document, one node per document
 )
 
 // NewDocStore returns the scheme-backed document backend (selected because this file's `scheme`
@@ -237,16 +238,92 @@ func (s *SchemeDocs) List() []Document {
 	return out
 }
 
-// Delete removes a document: its metadata node first (making it invisible), then its blob node.
-// scheme delete is idempotent — a missing node is not an error, so a text document (no blob) and a
-// crash between the two deletes both resolve cleanly.
+// SetExtract records a file document's derived text as a second described node at extracts/<id> and
+// stamps the small state/provenance fields onto the metadata node — the same entity reached through
+// this one access point, never a parallel store. For a "ready" extract the text node is written FIRST,
+// then the metadata is flipped, so a reader never sees state "ready" without the text behind it. A
+// "pending" or "failed" extract updates only the metadata (any prior text node is left intact, so a
+// re-read never destroys the last good one). An unknown id is a no-op (the document was deleted
+// mid-read). scheme's FFI takes a whole buffer, so an extract — being text, far smaller than the
+// source file — is a modest, bounded write here.
+func (s *SchemeDocs) SetExtract(id string, ex Extract) error {
+	if id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok, err := s.getBytes(docPrefix + "/" + id)
+	if err != nil || !ok {
+		return err // gone (or unreadable) → no-op; the extract for an absent document is discarded
+	}
+	var d Document
+	if json.Unmarshal(b, &d) != nil {
+		return nil
+	}
+	desc := strings.TrimSpace(d.Description)
+	if desc == "" {
+		desc = strings.TrimSpace(d.Title)
+	}
+	if desc == "" {
+		desc = "(no description)"
+	}
+	if ex.State == "ready" {
+		if err := s.putLocked(extractPrefix+"/"+id, desc, []byte(ex.Text)); err != nil {
+			return err
+		}
+	}
+	switch ex.State {
+	case "pending":
+		d.ExtractState = "pending"
+	case "ready":
+		d.ExtractState = "ready"
+		d.ExtractSource = ex.Source
+		d.ExtractModel = ex.Model
+		d.ExtractEngine = ex.Engine
+		d.ExtractError = ""
+		d.ExtractSize = int64(len(ex.Text))
+		d.ExtractedAt = ex.At
+	case "failed":
+		d.ExtractState = "failed"
+		d.ExtractError = ex.Error
+		d.ExtractedAt = ex.At
+	default:
+		return nil
+	}
+	meta, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+	return s.putLocked(docPrefix+"/"+id, desc, meta)
+}
+
+// ExtractText returns a file document's derived text (its extracts/<id> node), and whether present.
+func (s *SchemeDocs) ExtractText(id string) (string, bool) {
+	if id == "" {
+		return "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok, err := s.getBytes(extractPrefix + "/" + id)
+	if err != nil || !ok {
+		return "", false
+	}
+	return string(b), true
+}
+
+// Delete removes a document: its metadata node first (making it invisible), then its blob and extract
+// nodes. scheme delete is idempotent — a missing node is not an error, so a text document (no blob),
+// a file with no extract yet, and a crash between the deletes all resolve cleanly.
 func (s *SchemeDocs) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.deleteLocked(docPrefix + "/" + id); err != nil {
 		return err
 	}
-	return s.deleteLocked(blobPrefix + "/" + id)
+	if err := s.deleteLocked(blobPrefix + "/" + id); err != nil {
+		return err
+	}
+	return s.deleteLocked(extractPrefix + "/" + id)
 }
 
 // deleteLocked removes one node at path (caller holds s.mu). Idempotent.

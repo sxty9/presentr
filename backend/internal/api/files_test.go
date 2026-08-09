@@ -27,7 +27,11 @@ func newServer(t *testing.T) *Server {
 	}
 	// The upload/raw handlers reach only the document pool; the verifier, aigentic client and the
 	// other pools are exercised through the guard, which these tests call the handlers beneath.
-	return New(nil, docs, nil, nil, nil)
+	s := New(nil, docs, nil, nil, nil)
+	// An upload launches a background text read; drain those before the temp dir is torn down, so a
+	// read never races the cleanup (t.Cleanup runs LIFO — this runs before t.TempDir's own removal).
+	t.Cleanup(s.WaitExtractions)
+	return s
 }
 
 func user() *auth.User { return &auth.User{Username: "ada", Groups: []string{"hp_presentr_use"}} }
@@ -234,8 +238,9 @@ func TestUploadAtLimitAccepted(t *testing.T) {
 	}
 }
 
-// A batch with nothing usable answers 415 and still names why, and getRaw 404s a text document
-// (which carries no bytes).
+// A batch with nothing usable answers 415 and still names why, and getRaw serves a typed text
+// document's inline markdown (the viewer navigates one pool across all kinds, so a text note is
+// fetched the same way as a file). An unknown id still 404s.
 func TestUploadAllRejectedAndRawText(t *testing.T) {
 	s := newServer(t)
 
@@ -252,7 +257,7 @@ func TestUploadAllRejectedAndRawText(t *testing.T) {
 		t.Fatalf("all-rejected status %d, want 415", rec.Code)
 	}
 
-	// A text document has no blob → raw is a 404, not a server error.
+	// A text document's raw is its inline markdown, served under its stored type.
 	textID := store.NewID()
 	if err := s.docs.Add(store.Document{ID: textID, Title: "n", Kind: "text", Mime: "text/markdown", Content: "hi"}); err != nil {
 		t.Fatal(err)
@@ -261,7 +266,22 @@ func TestUploadAllRejectedAndRawText(t *testing.T) {
 	rreq.SetPathValue("id", textID)
 	rrec := httptest.NewRecorder()
 	s.getRaw(rrec, rreq, user())
-	if rrec.Code != http.StatusNotFound {
-		t.Fatalf("raw of a text document status %d, want 404", rrec.Code)
+	if rrec.Code != http.StatusOK {
+		t.Fatalf("raw of a text document status %d, want 200", rrec.Code)
+	}
+	if rrec.Body.String() != "hi" {
+		t.Fatalf("raw of a text document body %q, want %q", rrec.Body.String(), "hi")
+	}
+	if ct := rrec.Header().Get("Content-Type"); ct != "text/markdown" {
+		t.Fatalf("raw of a text document content-type %q, want %q", ct, "text/markdown")
+	}
+
+	// An unknown id still 404s.
+	ureq := httptest.NewRequest(http.MethodGet, "/x", nil)
+	ureq.SetPathValue("id", "does-not-exist")
+	urec := httptest.NewRecorder()
+	s.getRaw(urec, ureq, user())
+	if urec.Code != http.StatusNotFound {
+		t.Fatalf("raw of an unknown id status %d, want 404", urec.Code)
 	}
 }

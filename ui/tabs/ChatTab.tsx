@@ -1,3 +1,12 @@
+// PENDING — SHARED CHAT AWAITS THE SDK MOVE (holistic PR #15, the "@holisdk/ui" SDK-Umzug).
+// This is presentr's OWN working room chat, grounded in the document pool. It is deliberately NOT
+// the ONE shared @holistic/ui <Chat> building block: <Chat> (and its ChatAdapter/ChatEngine/
+// Conversation/… types) does not yet exist in @holistic/ui — it lives on holistic's unmerged
+// SDK-move branch (PR #15). Until that move lands, importing it breaks the dashboard's Vite build,
+// so the shared-chat rewrite is held back and this proven chat stays in place. When PR #15 merges,
+// swap this tab for the shared <Chat> driven by a room ChatAdapter (see the reverted commit
+// "one shared chat — drive @holisdk/ui <Chat> with a room ChatAdapter"). No second chat is built
+// here; only the forward-reference to the not-yet-shipped package is withdrawn.
 import { useEffect, useRef, useState } from 'react';
 import {
   Badge,

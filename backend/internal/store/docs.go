@@ -31,6 +31,37 @@ type Document struct {
 	Size        int64  `json:"size"`        // byte length of the item's content (text runes or file bytes)
 	Author      string `json:"author"`      // who added it (stamped by the api layer)
 	Created     int64  `json:"created"`     // epoch seconds (stamped by the api layer)
+
+	// Extraction: the derived plain text of a FILE document, read ONCE when the file is uploaded and
+	// kept beside the document so every later question works with a few hundred KB of text instead of
+	// re-reading a 70 MB file (the point of the feature). These are the SMALL metadata fields a
+	// List/Get carries (Portionierte Daten); the extract TEXT itself lives out of band, exactly like
+	// the file bytes, and is reached via ExtractText — so List stays cheap even as extracts grow. The
+	// extract is EITHER a PDF's machine-readable text layer read locally (exact, no AI) OR text
+	// recognized by aigentic's shared extract capability (an image, a scan — the text on a nameplate).
+	// A text document (kind "text") carries its text inline in Content, so it needs no separate
+	// extract and leaves these empty.
+	ExtractState  string `json:"extractState,omitempty"`  // "" (n/a) | "pending" | "ready" | "failed"
+	ExtractSource string `json:"extractSource,omitempty"` // "text-layer" (deterministic) | "ai" (recognized)
+	ExtractModel  string `json:"extractModel,omitempty"`  // the AI model that read it (Kennzeichnungspflicht)
+	ExtractEngine string `json:"extractEngine,omitempty"` // the AI engine that read it
+	ExtractError  string `json:"extractError,omitempty"`  // why the read failed (state=="failed"); a retry can clear it
+	ExtractSize   int64  `json:"extractSize,omitempty"`   // byte length of the extract text (storage accounting)
+	ExtractedAt   int64  `json:"extractedAt,omitempty"`   // epoch seconds the read completed
+}
+
+// Extract is the outcome of reading a file document's text, produced OUTSIDE the pool (the pool is
+// passive — it stores this, it never computes it) and handed to SetExtract. State is "ready" (Text
+// holds the read text), "failed" (Error names why; Text empty) or "pending" (a read is running/queued;
+// only State is touched, any prior Text is left intact so a retry never destroys the last good read).
+type Extract struct {
+	State  string // "pending" | "ready" | "failed"
+	Text   string // the read text (ready only)
+	Source string // "text-layer" | "ai" (ready only)
+	Model  string // AI model, when Source=="ai"
+	Engine string // AI engine, when Source=="ai"
+	Error  string // reason, when State=="failed"
+	At     int64  // epoch seconds the read completed (stamped by the caller)
 }
 
 // docState is the whole on-disk document: the room's flat, ordered list of items.
@@ -43,8 +74,9 @@ type docState struct {
 // in docs.json (their markdown inline); an uploaded file's raw bytes live out of band as one file
 // per document under blobDir, so the metadata list a poll walks stays small (Portionierte Daten).
 type DocPool struct {
-	path    string
-	blobDir string
+	path       string
+	blobDir    string
+	extractDir string // one file per document holding its derived extract text, kept out of the metadata a List walks
 	pool[docState]
 }
 
@@ -57,7 +89,11 @@ func OpenDocs(path string) (*DocPool, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	p := &DocPool{path: path, blobDir: filepath.Join(filepath.Dir(path), "blobs")}
+	p := &DocPool{
+		path:       path,
+		blobDir:    filepath.Join(filepath.Dir(path), "blobs"),
+		extractDir: filepath.Join(filepath.Dir(path), "extracts"),
+	}
 	p.st = docState{Docs: []Document{}}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -169,9 +205,90 @@ func (p *DocPool) OpenBlob(id string) (io.ReadSeekCloser, int64, bool) {
 	return f, fi.Size(), true
 }
 
+// SetExtract records the outcome of reading a file document's text (computed OUTSIDE the pool — the
+// pool only stores it, Passive Speicher). It is reached through the SAME access point as the document
+// (no parallel store): the extract text is kept out of band as one file per document, and the small
+// state/provenance fields are stamped onto the document metadata. The metadata write is the single
+// commit point (Atomare Zugriffe): for a "ready" extract the text file is written FIRST, then the
+// metadata is flipped, so a reader never sees state "ready" without the text behind it. A "pending"
+// extract touches only the state (leaving any prior text intact, so a re-read never destroys the last
+// good one); a "failed" extract records the reason and leaves any prior text intact. An id that no
+// longer exists (the document was deleted mid-read) is a no-op — the extract for a gone document is
+// simply discarded.
+func (p *DocPool) SetExtract(id string, ex Extract) error {
+	if id == "" {
+		return nil
+	}
+	if ex.State == "ready" {
+		// Write the text out of band first; it becomes reachable only once the metadata flip below
+		// lands, so the two never disagree. atomicWrite gives the same temp→fsync→rename durability the
+		// metadata file gets, so a crash never leaves a half-written extract.
+		if _, err := atomicWrite(filepath.Join(p.extractDir, id), []byte(ex.Text)); err != nil {
+			return err
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	idx := -1
+	for i := range p.st.Docs {
+		if p.st.Docs[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		// The document is gone; drop the orphan extract we may have just written.
+		if ex.State == "ready" {
+			_ = os.Remove(filepath.Join(p.extractDir, id))
+		}
+		return nil
+	}
+	prev := append([]Document{}, p.st.Docs...)
+	d := p.st.Docs[idx]
+	switch ex.State {
+	case "pending":
+		d.ExtractState = "pending"
+	case "ready":
+		d.ExtractState = "ready"
+		d.ExtractSource = ex.Source
+		d.ExtractModel = ex.Model
+		d.ExtractEngine = ex.Engine
+		d.ExtractError = ""
+		d.ExtractSize = int64(len(ex.Text))
+		d.ExtractedAt = ex.At
+	case "failed":
+		d.ExtractState = "failed"
+		d.ExtractError = ex.Error
+		d.ExtractedAt = ex.At
+	default:
+		return nil
+	}
+	p.st.Docs[idx] = d
+	committed, err := p.persist(p.path)
+	if err != nil && !committed {
+		p.st.Docs = prev
+	}
+	return err
+}
+
+// ExtractText returns the derived text of a file document, and whether it was found. It buffers the
+// whole extract (bounded — a stored extract is text, far smaller than the file it came from), so it
+// serves the AI grounding without ever loading the original file bytes.
+func (p *DocPool) ExtractText(id string) (string, bool) {
+	if id == "" {
+		return "", false
+	}
+	b, err := os.ReadFile(filepath.Join(p.extractDir, id))
+	if err != nil {
+		return "", false
+	}
+	return string(b), true
+}
+
 // Delete removes the document with the given id. Missing id is a no-op (idempotent). Atomic:
 // a failed persist restores the prior slice, so a rejected delete leaves no observable trace. The
-// metadata is removed first (making the document invisible); its blob is then dropped best-effort.
+// metadata is removed first (making the document invisible); its blob and extract are then dropped
+// best-effort.
 func (p *DocPool) Delete(id string) error {
 	p.mu.Lock()
 	prev := p.st.Docs
@@ -192,7 +309,8 @@ func (p *DocPool) Delete(id string) error {
 	}
 	p.mu.Unlock()
 	if err == nil {
-		_ = os.Remove(filepath.Join(p.blobDir, id)) // drop the blob once the metadata is gone
+		_ = os.Remove(filepath.Join(p.blobDir, id))    // drop the blob once the metadata is gone
+		_ = os.Remove(filepath.Join(p.extractDir, id)) // and its derived extract text
 	}
 	return err
 }

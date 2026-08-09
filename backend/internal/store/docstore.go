@@ -43,5 +43,17 @@ type DocStore interface {
 	// the bytes to a client without buffering the whole file (a 100 MB download). The caller must
 	// Close the reader. A missing blob (a text document, or an unknown id) reports found=false.
 	OpenBlob(id string) (io.ReadSeekCloser, int64, bool)
+	// SetExtract records the outcome of reading a file document's text — computed OUTSIDE the pool (the
+	// pool is passive; the AI/text-layer read happens in the api/extract layer) and handed here to be
+	// stored. The extract TEXT lives out of band beside the file bytes (kept out of List/Get, which
+	// stay metadata-only — Portionierte Daten) while the small state/provenance fields land on the
+	// document. It is the SAME entity reached through this ONE access point — no second store, no
+	// parallel data path (Zugangspunkt wiederverwenden). The metadata write is the single commit point:
+	// a "ready" extract's text is written before its state flips, so state "ready" always has text
+	// behind it. An unknown id is a no-op (the document was deleted mid-read). Carried by BOTH backends.
+	SetExtract(id string, ex Extract) error
+	// ExtractText returns a file document's derived text (a bounded read — an extract is text, far
+	// smaller than its source file), for the AI grounding, and whether it was found.
+	ExtractText(id string) (string, bool)
 	Delete(id string) error
 }
