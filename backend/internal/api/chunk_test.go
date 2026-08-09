@@ -23,7 +23,7 @@ type fakeAI struct {
 	mu    sync.Mutex
 	calls int
 	seen  []string // the filename passed for each call (carries the section label)
-	reply func(call int) (string, error)
+	reply func(call int, filename string) (string, error)
 }
 
 func (f *fakeAI) Extract(_ context.Context, _, filename, _ string, _ []byte) (string, string, string, error) {
@@ -32,7 +32,7 @@ func (f *fakeAI) Extract(_ context.Context, _, filename, _ string, _ []byte) (st
 	call := f.calls
 	f.seen = append(f.seen, filename)
 	f.mu.Unlock()
-	text, err := f.reply(call)
+	text, err := f.reply(call, filename)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -59,7 +59,7 @@ func sections(n int) []extract.Section {
 func TestChunkedReadAssemblesEverySection(t *testing.T) {
 	s := newServer(t)
 	fileDoc(t, s, "big")
-	ai := &fakeAI{reply: func(call int) (string, error) { return fmt.Sprintf("TEXT_OF_SECTION_%d", call), nil }}
+	ai := &fakeAI{reply: func(call int, _ string) (string, error) { return fmt.Sprintf("TEXT_OF_SECTION_%d", call), nil }}
 
 	s.readSections("big", "ada", "manual.pdf", sections(3), ai)
 
@@ -96,7 +96,7 @@ func TestChunkedReadResumesAfterInterruption(t *testing.T) {
 	fileDoc(t, s, "big")
 
 	// First run: section 1 succeeds, section 2 fails with an engine-unavailable error → interruption.
-	first := &fakeAI{reply: func(call int) (string, error) {
+	first := &fakeAI{reply: func(call int, _ string) (string, error) {
 		if call == 2 {
 			return "", aigentic.ErrUnavailable
 		}
@@ -119,7 +119,7 @@ func TestChunkedReadResumesAfterInterruption(t *testing.T) {
 	}
 
 	// Second run (a retry): the engine is back. It must resume — only sections 2..4 are read.
-	second := &fakeAI{reply: func(call int) (string, error) { return fmt.Sprintf("RESUMED_%d", call), nil }}
+	second := &fakeAI{reply: func(call int, _ string) (string, error) { return fmt.Sprintf("RESUMED_%d", call), nil }}
 	s.readSections("big", "ada", "manual.pdf", sections(4), second)
 
 	d, _ = s.docs.Get("big")
@@ -137,6 +137,69 @@ func TestChunkedReadResumesAfterInterruption(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("resumed sections missing from assembled text: %q", text)
 		}
+	}
+}
+
+// A section that is structurally too slow (it keeps timing out) is tried a BOUNDED number of times, then
+// named as unread and SKIPPED — the read must NOT loop on it forever, and the sections around it must
+// still be read and the document reach "ready".
+func TestChunkedReadSkipsStructurallySlowSection(t *testing.T) {
+	s := newServer(t)
+	fileDoc(t, s, "big")
+
+	slowCalls := 0
+	ai := &fakeAI{reply: func(_ int, filename string) (string, error) {
+		if strings.Contains(filename, "page 2") {
+			slowCalls++
+			return "", context.DeadlineExceeded // this one page never finishes in time
+		}
+		return "TEXT_" + filename, nil
+	}}
+	s.readSections("big", "ada", "manual.pdf", sections(3), ai)
+
+	d, _ := s.docs.Get("big")
+	if d.ExtractState != "ready" {
+		t.Fatalf("a structurally-slow section must not block the whole read; state=%q err=%q", d.ExtractState, d.ExtractError)
+	}
+	if slowCalls != maxSectionAttempts {
+		t.Fatalf("the slow section must be tried exactly %d times (bounded), got %d", maxSectionAttempts, slowCalls)
+	}
+	text, _ := s.docs.ExtractText("big")
+	if !strings.Contains(text, "page 1") || !strings.Contains(text, "page 3") {
+		t.Fatalf("the sections around the slow one must still be read: %q", text)
+	}
+	if !strings.Contains(text, "could not be read") {
+		t.Fatalf("the skipped section must be NAMED as unread in the assembled text: %q", text)
+	}
+	if _, ok := s.docs.ExtractJob("big"); ok {
+		t.Fatal("a completed read must leave no resume job")
+	}
+}
+
+// A timeout counts against the section's attempt budget across a RESUME, so a user who keeps retrying a
+// structurally-slow section does not reset the escalation each time — it converges on the skip instead of
+// re-trying from the short deadline forever.
+func TestChunkedReadTimeoutAttemptsCarryAcrossResume(t *testing.T) {
+	s := newServer(t)
+	fileDoc(t, s, "big")
+
+	// Every run: section 1 reads, section 2 times out. With maxSectionAttempts==2 the FIRST run spends both
+	// attempts on section 2 in-process, then skips it — so a single run already reaches "ready".
+	slow := &fakeAI{reply: func(_ int, filename string) (string, error) {
+		if strings.Contains(filename, "page 2") {
+			return "", context.DeadlineExceeded
+		}
+		return "OK_" + filename, nil
+	}}
+	s.readSections("big", "ada", "manual.pdf", sections(2), slow)
+
+	d, _ := s.docs.Get("big")
+	if d.ExtractState != "ready" {
+		t.Fatalf("the read must converge on ready after the slow section is abandoned, got %q", d.ExtractState)
+	}
+	text, _ := s.docs.ExtractText("big")
+	if !strings.Contains(text, "OK_") || !strings.Contains(text, "could not be read") {
+		t.Fatalf("the read section must survive and the slow one be named: %q", text)
 	}
 }
 

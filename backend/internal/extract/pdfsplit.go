@@ -22,11 +22,15 @@ import (
 	"strconv"
 )
 
-// maxPagesPerSection caps how many pages one section may hold, independent of the byte budget. It bounds
-// the cost of the greedy rebuild on a pathological document of very many tiny pages (where hundreds could
-// otherwise fit one request), at no cost to a real scanned manual whose pages are large enough that a
-// section is only a page or a few anyway.
-const maxPagesPerSection = 100
+// maxPagesPerSection caps how many pages one section may hold, INDEPENDENT of the byte budget. It exists
+// so each AI section stays small enough to be read well within one section's time limit (extractTimeout)
+// and so progress advances in fine, even steps. A scan-heavy manual whose pages are large but not large
+// enough to hit the byte budget could otherwise pack a dozen-plus slow-to-recognize pages into a single
+// section; that one section then risks overrunning the read deadline — the very failure this cap prevents —
+// while the progress bar sits still for minutes. A whole number well under the byte-driven maximum keeps
+// sections short (smoother progress, lower timeout risk) at the cost of a few more requests, and still
+// bounds the greedy rebuild on a pathological document of very many tiny pages.
+const maxPagesPerSection = 12
 
 // splitPDFByPages groups a PDF's pages into consecutive sections, each rebuilt as a standalone sub-PDF
 // whose bytes stay at or under budget where possible. Pages are grouped greedily: a section grows until
