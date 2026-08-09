@@ -604,6 +604,7 @@ function TrackStatus({ doc, t }: { doc: Document; t: ReturnType<typeof useT> }) 
   const total = doc.extractSectionsTotal ?? 0;
   const done = doc.extractSectionsDone ?? 0;
   const label = doc.extractSectionLabel ?? '';
+  const phase = doc.extractSectionPhase ?? '';
   const hasTextTrack = !!doc.extractTextLayer;
   const imagesInProgress = total > 0 && done < total;
   return (
@@ -619,9 +620,13 @@ function TrackStatus({ doc, t }: { doc: Document; t: ReturnType<typeof useT> }) 
           <Badge variant={imagesInProgress ? 'neutral' : 'success'}>{t('presentr.trackImagesHeading')}</Badge>
           <Text variant="caption" color="secondary">
             {imagesInProgress
-              ? label
-                ? t('presentr.trackImagesCurrent', { label, done, total })
-                : t('presentr.trackImagesProgress', { done, total })
+              ? // Each image has TWO sub-steps: it is first compressed (downscaled for the AI), then read.
+                // Show the actual one so the wait is "Compressing image 3 of 11", then "Reading image on page 6".
+                phase === 'compressing'
+                ? t('presentr.trackImagesCompressing', { n: done + 1, total })
+                : label
+                  ? t('presentr.trackImagesCurrent', { label, done, total })
+                  : t('presentr.trackImagesProgress', { done, total })
               : t('presentr.trackImagesReady', { total })}
           </Text>
         </Stack>

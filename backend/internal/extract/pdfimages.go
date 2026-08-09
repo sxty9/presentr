@@ -43,20 +43,22 @@ const visionJPEGQuality = 82
 // frame (about 12 megapixels) sits well under it.
 const maxImagePixels = 64 << 20 // 64 megapixels
 
-// extractImageSections enumerates the embedded raster images of a PDF, one Section per image, each a
-// downscaled JPEG ready for the vision AI and labelled by the page it appears on. It also returns how
-// many embedded images were found but could NOT be decoded (an unsupported codec such as JBIG2 or
-// JPEG2000), so the caller can disclose that gap rather than silently drop those images' text. ok is
-// false only when the PDF cannot be parsed into pages at all — the caller then falls back to reading the
-// whole document by AI, so nothing is lost.
-func extractImageSections(data []byte, budget int) (sections []Section, skipped int, ok bool) {
+// extractImageSections enumerates the embedded raster images of a PDF, one Section per image, labelled
+// by the page it appears on. It does NOT compress the images here: each section carries a DEFERRED
+// render step (Section.Compress) that decodes, downscales and JPEG-encodes the image on demand, so the
+// caller can run that compression as its own visible per-image step, separate from the AI read of the
+// same image (the task's per-image compression step). An image in a codec this reader cannot decode
+// (JBIG2, JPEG2000, CCITT fax) is still a section; its Compress reports ok=false, and the caller names
+// that image as an undecoded gap rather than silently dropping it. ok is false only when the PDF cannot
+// be parsed into pages at all — the caller then falls back to reading the whole document by AI.
+func extractImageSections(data []byte) (sections []Section, ok bool) {
 	doc, ok := parsePDF(data)
 	if !ok || len(doc.pages) == 0 {
-		return nil, 0, false
+		return nil, false
 	}
 	imgs := locateImages(doc)
 	if len(imgs) == 0 {
-		return nil, 0, true
+		return nil, true
 	}
 	// Count images per page so a page with several images can label them "image 2 of 6".
 	perPage := map[int]int{}
@@ -67,21 +69,16 @@ func extractImageSections(data []byte, budget int) (sections []Section, skipped 
 	for _, im := range imgs {
 		pageSeen[im.page]++
 		label := imageLabel(im.page, pageSeen[im.page], perPage[im.page])
-		jpg, dok := renderImageForVision(doc, im)
-		if !dok {
-			skipped++
-			continue
-		}
+		im := im // capture per iteration for the deferred render closure below
 		sections = append(sections, Section{
 			Label:  label,
 			Mime:   "image/jpeg",
-			Data:   jpg,
 			Track:  "image",
 			Page:   im.page,
-			TooBig: len(jpg) > budget, // defensive; a downscaled JPEG is far under any real budget
+			render: func() ([]byte, bool) { return renderImageForVision(doc, im) },
 		})
 	}
-	return sections, skipped, true
+	return sections, true
 }
 
 // imageLabel names an image section by the page it sits on, adding its position when the page holds more

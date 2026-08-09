@@ -55,6 +55,14 @@ type DocStore interface {
 	// ExtractText returns a file document's derived text (a bounded read — an extract is text, far
 	// smaller than its source file), for the AI grounding, and whether it was found.
 	ExtractText(id string) (string, bool)
+	// SetExtractImages stores the compressed images read out of a file document (a PDF's embedded pictures,
+	// decoded and downscaled at upload). They ride beside the extract text as part of the SAME entity (no
+	// second store, no parallel data path — Zugangspunkt wiederverwenden), kept off List/Get (Portionierte
+	// Daten) and reached only for the AI grounding, so the assistant can be shown the pictures themselves,
+	// not only their transcribed text. An empty slice clears them. Carried by BOTH backends.
+	SetExtractImages(id string, imgs []ExtractImage) error
+	// ExtractImages returns the compressed images read out of a file document, and whether any are present.
+	ExtractImages(id string) ([]ExtractImage, bool)
 	// SetExtractJob persists the in-progress job of a chunked read (a large PDF read page-range by
 	// page-range), so a read interrupted by a crash or an engine outage RESUMES rather than restarting.
 	// It rides beside the extract text as part of the SAME entity (no second store), computed outside

@@ -64,6 +64,24 @@ type Document struct {
 	ExtractSectionsDone  int    `json:"extractSectionsDone,omitempty"`
 	ExtractSectionsTotal int    `json:"extractSectionsTotal,omitempty"`
 	ExtractSectionLabel  string `json:"extractSectionLabel,omitempty"`
+	// ExtractSectionPhase names the CURRENT sub-step of the image track for the section in progress:
+	// "compressing" (the picture is being decoded and downscaled) or "reading" (its compact form is at
+	// the vision AI). The two are distinct steps of the SAME image, so the UI shows "Compressing image 3
+	// of 11" then "Reading image on page 6" rather than one opaque counter. Empty when no image section
+	// is in progress.
+	ExtractSectionPhase string `json:"extractSectionPhase,omitempty"`
+}
+
+// ExtractImage is one compressed picture read OUT of a file document at upload — a PDF's embedded image,
+// decoded, downscaled and JPEG-encoded ONCE (the image-compression step) and kept beside the extract
+// text as part of the SAME entity. It lets the room assistant later be shown the PICTURE itself
+// (image/jpeg), not only the text transcribed from it (the combination of text, image-text AND image).
+// Index is the picture's position among the file's read sections, so a resumed read re-keys its images
+// without duplicating them; Page names the source page for grounding provenance; Data is the JPEG bytes.
+type ExtractImage struct {
+	Index int    `json:"index"`
+	Page  int    `json:"page"`
+	Data  []byte `json:"data"`
 }
 
 // Extract is the outcome of reading a file document's text, produced OUTSIDE the pool (the pool is
@@ -86,6 +104,7 @@ type Extract struct {
 	SectionsDone  int
 	SectionsTotal int
 	SectionLabel  string
+	SectionPhase  string // "compressing" | "reading" — the current sub-step of the image section in progress
 }
 
 // docState is the whole on-disk document: the room's flat, ordered list of items.
@@ -101,6 +120,7 @@ type DocPool struct {
 	path       string
 	blobDir    string
 	extractDir string // one file per document holding its derived extract text, kept out of the metadata a List walks
+	imageDir   string // one file per document holding its compressed extract images (JSON), kept out of the metadata
 	jobDir     string // one file per document holding an in-progress chunked-read job, so a read resumes after a crash
 	pool[docState]
 }
@@ -118,6 +138,7 @@ func OpenDocs(path string) (*DocPool, error) {
 		path:       path,
 		blobDir:    filepath.Join(filepath.Dir(path), "blobs"),
 		extractDir: filepath.Join(filepath.Dir(path), "extracts"),
+		imageDir:   filepath.Join(filepath.Dir(path), "extract-images"),
 		jobDir:     filepath.Join(filepath.Dir(path), "extract-jobs"),
 	}
 	p.st = docState{Docs: []Document{}}
@@ -277,6 +298,7 @@ func (p *DocPool) SetExtract(id string, ex Extract) error {
 		d.ExtractTextLayer = false
 		d.ExtractSectionsDone, d.ExtractSectionsTotal = 0, 0
 		d.ExtractSectionLabel = ""
+		d.ExtractSectionPhase = ""
 	case "reading":
 		// A chunked read is in progress: record how far it has got, leaving any prior text intact.
 		d.ExtractState = "reading"
@@ -284,6 +306,7 @@ func (p *DocPool) SetExtract(id string, ex Extract) error {
 		d.ExtractSectionsDone = ex.SectionsDone
 		d.ExtractSectionsTotal = ex.SectionsTotal
 		d.ExtractSectionLabel = ex.SectionLabel
+		d.ExtractSectionPhase = ex.SectionPhase
 	case "ready":
 		// The text is usable. The image track may STILL be running (SectionsDone < SectionsTotal), so the
 		// counters are kept rather than cleared — they show the image track augmenting an already-usable read.
@@ -297,11 +320,13 @@ func (p *DocPool) SetExtract(id string, ex Extract) error {
 		d.ExtractTextLayer = ex.TextLayer
 		d.ExtractSectionsDone, d.ExtractSectionsTotal = ex.SectionsDone, ex.SectionsTotal
 		d.ExtractSectionLabel = ex.SectionLabel
+		d.ExtractSectionPhase = ex.SectionPhase
 	case "failed":
 		d.ExtractState = "failed"
 		d.ExtractError = ex.Error
 		d.ExtractedAt = ex.At
 		d.ExtractTextLayer = ex.TextLayer
+		d.ExtractSectionPhase = ""
 		// Keep the section counters so a resumable failure still shows how far it got.
 		if ex.SectionsTotal > 0 {
 			d.ExtractSectionsDone, d.ExtractSectionsTotal = ex.SectionsDone, ex.SectionsTotal
@@ -364,6 +389,43 @@ func (p *DocPool) ExtractText(id string) (string, bool) {
 	return string(b), true
 }
 
+// SetExtractImages stores the compressed images read out of a file document, out of band beside its
+// extract text as part of the SAME entity (one access point, no parallel store). Written atomically
+// (temp→fsync→rename). An empty slice CLEARS the store (a fresh read starts with none). Kept off the
+// metadata a List walks (Portionierte Daten) and reached only for the AI grounding.
+func (p *DocPool) SetExtractImages(id string, imgs []ExtractImage) error {
+	if id == "" {
+		return nil
+	}
+	path := filepath.Join(p.imageDir, id)
+	if len(imgs) == 0 {
+		_ = os.Remove(path)
+		return nil
+	}
+	b, err := json.Marshal(imgs)
+	if err != nil {
+		return err
+	}
+	_, err = atomicWrite(path, b)
+	return err
+}
+
+// ExtractImages returns the compressed images read out of a file document, and whether any are present.
+func (p *DocPool) ExtractImages(id string) ([]ExtractImage, bool) {
+	if id == "" {
+		return nil, false
+	}
+	b, err := os.ReadFile(filepath.Join(p.imageDir, id))
+	if err != nil {
+		return nil, false
+	}
+	var imgs []ExtractImage
+	if json.Unmarshal(b, &imgs) != nil || len(imgs) == 0 {
+		return nil, false
+	}
+	return imgs, true
+}
+
 // Delete removes the document with the given id. Missing id is a no-op (idempotent). Atomic:
 // a failed persist restores the prior slice, so a rejected delete leaves no observable trace. The
 // metadata is removed first (making the document invisible); its blob and extract are then dropped
@@ -390,6 +452,7 @@ func (p *DocPool) Delete(id string) error {
 	if err == nil {
 		_ = os.Remove(filepath.Join(p.blobDir, id))    // drop the blob once the metadata is gone
 		_ = os.Remove(filepath.Join(p.extractDir, id)) // and its derived extract text
+		_ = os.Remove(filepath.Join(p.imageDir, id))   // and its compressed extract images
 		_ = os.Remove(filepath.Join(p.jobDir, id))     // and any in-progress read job
 	}
 	return err

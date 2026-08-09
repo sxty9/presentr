@@ -171,3 +171,131 @@ func TestAskForwardsToAigentic(t *testing.T) {
 		t.Fatalf("forwarded %d grounding parts, want 1", gotInline)
 	}
 }
+
+// A file that was read from BOTH its text and its images grounds by the text AND by the pictures
+// themselves: each read-out image rides as its own image/jpeg part, named by document and page, so the
+// assistant SEES the nameplate/wiring photo — not only the text transcribed from it.
+func TestRoomGroundingIncludesReadImages(t *testing.T) {
+	s := newServer(t)
+	if _, err := s.docs.AddFile(store.Document{ID: "man", Title: "manual.pdf", Kind: "file", Mime: "application/pdf", ExtractState: "pending"}, bytes.NewReader([]byte("%PDF-1.7")), 100<<20); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.docs.SetExtract("man", store.Extract{State: "ready", Text: "Projector nameplate", Source: "mixed", Model: "claude"}); err != nil {
+		t.Fatal(err)
+	}
+	jpg := []byte("\xff\xd8\xff\xe0 pretend-jpeg-bytes")
+	if err := s.docs.SetExtractImages("man", []store.ExtractImage{{Index: 0, Page: 2, Data: jpg}}); err != nil {
+		t.Fatal(err)
+	}
+
+	parts, gaps := s.roomGrounding("")
+	if len(gaps.omittedImages) != 0 {
+		t.Fatalf("a small image must fit, got omitted %+v", gaps.omittedImages)
+	}
+	var text, image *aigentic.InlineFile
+	for i := range parts {
+		switch parts[i].MediaType {
+		case "text/markdown":
+			text = &parts[i]
+		case "image/jpeg":
+			image = &parts[i]
+		}
+	}
+	if text == nil || text.Content != "Projector nameplate" {
+		t.Fatalf("the read text must still be grounded alongside the image: %+v", text)
+	}
+	if image == nil {
+		t.Fatalf("the read-out image must be grounded as its own image/jpeg part")
+	}
+	if image.Path != "manual.pdf (image on page 2)" {
+		t.Fatalf("the image part must name its document and page, got %q", image.Path)
+	}
+	if image.Content != base64.StdEncoding.EncodeToString(jpg) {
+		t.Fatalf("the image part must be base64 of the compressed bytes")
+	}
+}
+
+// The image budget is binding: an image that no longer fits alongside the text is NAMED (omittedImages),
+// never silently dropped, so the answer discloses it (Kein stummes Ausbleiben).
+func TestRoomGroundingNamesOmittedImage(t *testing.T) {
+	s := newServer(t)
+	if _, err := s.docs.AddFile(store.Document{ID: "man", Title: "big.pdf", Kind: "file", Mime: "application/pdf", ExtractState: "pending"}, bytes.NewReader([]byte("%PDF-1.7")), 100<<20); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.docs.SetExtract("man", store.Extract{State: "ready", Text: "short", Source: "mixed"}); err != nil {
+		t.Fatal(err)
+	}
+	huge := bytes.Repeat([]byte{0xff}, maxGroundingBytes) // its base64 overruns the remaining budget
+	if err := s.docs.SetExtractImages("man", []store.ExtractImage{{Index: 0, Page: 1, Data: huge}}); err != nil {
+		t.Fatal(err)
+	}
+	parts, gaps := s.roomGrounding("")
+	for _, p := range parts {
+		if p.MediaType == "image/jpeg" {
+			t.Fatalf("an over-budget image must not be sent")
+		}
+	}
+	if len(gaps.omittedImages) != 1 || gaps.omittedImages[0] != "big.pdf (image on page 1)" {
+		t.Fatalf("an over-budget image must be named as omitted, got %+v", gaps.omittedImages)
+	}
+	if note := groundingNote(gaps); !strings.Contains(note, "big.pdf (image on page 1)") {
+		t.Fatalf("the note must disclose the omitted image: %q", note)
+	}
+}
+
+// When the grounding carries room images but the only reachable engine cannot see images, aigentic
+// refuses the turn (422). Rather than lose the assistant, ask retries the turn WITHOUT the images so the
+// room still gets a text-grounded answer, and the model is told it could not see the pictures.
+func TestAskRetriesTextOnlyWhenNoVisionEngine(t *testing.T) {
+	var sawImage []bool
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Data json.RawMessage `json:"data"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		var data struct {
+			Inline []aigentic.InlineFile `json:"inline"`
+		}
+		_ = json.Unmarshal(body.Data, &data)
+		hasImage := false
+		for _, f := range data.Inline {
+			if strings.HasPrefix(f.MediaType, "image/") {
+				hasImage = true
+			}
+		}
+		sawImage = append(sawImage, hasImage)
+		if hasImage {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			io.WriteString(w, `{"detail":"the attached image(s) could not be read: no image-capable model is available"}`)
+			return
+		}
+		io.WriteString(w, `{"data":{"output":"answer from text","engine":"ollama","model":"qwen"}}`)
+	}))
+	defer stub.Close()
+
+	s := newServer(t)
+	s.ai = aigentic.New(stub.URL, "sekret")
+	if _, err := s.docs.AddFile(store.Document{ID: "man", Title: "manual.pdf", Kind: "file", Mime: "application/pdf", ExtractState: "pending"}, bytes.NewReader([]byte("%PDF-1.7")), 100<<20); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.docs.SetExtract("man", store.Extract{State: "ready", Text: "nameplate text", Source: "mixed"})
+	_ = s.docs.SetExtractImages("man", []store.ExtractImage{{Index: 0, Page: 1, Data: []byte("jpegbytes")}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(`{"prompt":"what model is the projector?"}`))
+	s.ask(rec, req, user())
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ask must fall back to a text-only answer, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(sawImage) != 2 || !sawImage[0] || sawImage[1] {
+		t.Fatalf("expected an image turn then a text-only retry, got %v", sawImage)
+	}
+	var out struct {
+		Output string `json:"output"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if out.Output != "answer from text" {
+		t.Fatalf("the text-only retry's answer must be returned: %q", out.Output)
+	}
+}

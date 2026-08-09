@@ -404,3 +404,58 @@ func TestExtractFailedAndDelete(t *testing.T) {
 		}
 	}
 }
+
+// The compressed images read out of a file ride beside the extract as part of the SAME entity: they
+// round-trip through disk, are kept off the metadata a List walks (Portionierte Daten), an empty set
+// clears them, and Delete drops them with the document. This is what lets the assistant later be shown
+// the pictures themselves, not only their transcribed text.
+func TestExtractImagesRoundTripAndDelete(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "data", "docs.json")
+	p, err := OpenDocs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.AddFile(Document{ID: "f", Title: "manual.pdf", Kind: "file", Mime: "application/pdf"}, bytes.NewReader([]byte("%PDF-1.7")), 100<<20); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p.ExtractImages("f"); ok {
+		t.Fatalf("a file with no read has no images yet")
+	}
+	imgs := []ExtractImage{{Index: 0, Page: 1, Data: []byte("jpeg-A")}, {Index: 3, Page: 4, Data: []byte("jpeg-B")}}
+	if err := p.SetExtractImages("f", imgs); err != nil {
+		t.Fatal(err)
+	}
+	// The images are out of band: a List/Get stays metadata-only (no image bytes ride the Document).
+	for _, d := range p.List() {
+		if strings.Contains(d.Title, "jpeg") {
+			t.Fatalf("images must not leak onto the metadata list")
+		}
+	}
+	// Reopen from disk: the images survive with their index, page and bytes intact.
+	p2, err := OpenDocs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := p2.ExtractImages("f")
+	if !ok || len(got) != 2 || got[0].Page != 1 || string(got[0].Data) != "jpeg-A" || got[1].Index != 3 || string(got[1].Data) != "jpeg-B" {
+		t.Fatalf("images did not round-trip: ok=%v %+v", ok, got)
+	}
+	// An empty set clears them.
+	if err := p2.SetExtractImages("f", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p2.ExtractImages("f"); ok {
+		t.Fatalf("an empty set must clear the stored images")
+	}
+	// Delete drops the images with the document (write them back first).
+	if err := p2.SetExtractImages("f", imgs); err != nil {
+		t.Fatal(err)
+	}
+	if err := p2.Delete("f"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p2.ExtractImages("f"); ok {
+		t.Fatalf("Delete must drop the stored images")
+	}
+}
